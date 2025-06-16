@@ -411,8 +411,15 @@ class LookMLToOmniConverter:
         
         converted_props = {}
         
+        # First, handle SQL field which is critical
+        if 'sql' in props:
+            converted_props['sql'] = f'"{props["sql"]}"'
+        
+        # Apply property mappings
         for key, value in props.items():
-            # Apply property mappings
+            if key == 'sql':
+                continue  # Already handled
+                
             if key in self.property_mappings:
                 if key == 'type':
                     mapped = self.property_mappings[key](value, obj_type)
@@ -428,18 +435,68 @@ class LookMLToOmniConverter:
                 continue
             
             # Direct mappings
-            if key == 'sql' or key.startswith('sql_'):
-                # For SQL statements, wrap in quotes as-is
+            if key.startswith('sql_'):
                 converted_props[key] = f'"{value}"'
-            else:
+            elif key not in ['hidden', 'type', 'value_format_name', 'primary_key']:
                 converted_props[key] = value
         
-        # Add group_label for dimension_groups
-        if obj_type == 'dimension_group':
+        # Add required metadata with defaults if not present
+        if obj_type in ['dimension', 'dimension_group']:
+            # Ensure label exists
+            if 'label' not in converted_props:
+                # Generate label from name
+                converted_props['label'] = ' '.join(word.capitalize() for word in name.split('_'))
+            
+            # Add group_label
             if 'group_label' not in converted_props:
-                # Capitalize first letter of each word
-                label = ' '.join(word.capitalize() for word in name.split('_'))
-                converted_props['group_label'] = label
+                if obj_type == 'dimension_group':
+                    converted_props['group_label'] = ' '.join(word.capitalize() for word in name.split('_'))
+                else:
+                    # Try to infer group from name or use a default
+                    parts = name.split('_')
+                    if len(parts) > 1:
+                        converted_props['group_label'] = parts[0].capitalize()
+                    else:
+                        converted_props['group_label'] = 'Dimensions'
+            
+            # Add description if not present
+            if 'description' not in converted_props:
+                converted_props['description'] = f"Description for {converted_props['label']}"
+            
+            # Handle hidden property
+            if 'hidden' in props and props['hidden'] in ['yes', True]:
+                converted_props['hidden'] = 'yes'
+            else:
+                # If hidden was 'no' or not specified, add business_facing tag
+                if 'tags' not in converted_props:
+                    converted_props['tags'] = ['business_facing']
+                converted_props['hidden'] = 'no'
+                
+        elif obj_type == 'measure':
+            # For measures, ensure we have aggregate_type
+            if 'aggregate_type' not in converted_props:
+                # Try to infer from type or name
+                if 'type' in props:
+                    measure_type = props['type']
+                    if measure_type in ['count', 'count_distinct', 'sum', 'average', 'max', 'min', 'median']:
+                        converted_props['aggregate_type'] = 'avg' if measure_type == 'average' else measure_type
+                    else:
+                        converted_props['aggregate_type'] = 'sum'  # default
+                else:
+                    converted_props['aggregate_type'] = 'sum'  # default
+            
+            # Ensure label exists
+            if 'label' not in converted_props:
+                converted_props['label'] = ' '.join(word.capitalize() for word in name.split('_'))
+            
+            # Add group_label
+            if 'group_label' not in converted_props:
+                # Try to infer from name
+                parts = name.split('_')
+                if len(parts) > 1 and parts[0] in ['sum', 'count', 'avg', 'max', 'min']:
+                    converted_props['group_label'] = ' '.join(word.capitalize() for word in parts[1:])
+                else:
+                    converted_props['group_label'] = 'Measures'
         
         result[plural_type][name] = converted_props
     
@@ -482,8 +539,8 @@ class LookMLToOmniConverter:
         
         # Property order for better organization
         property_order = [
-            'sql', 'label', 'tags', 'format', 'description', 
-            'display_order', 'group_label', 'primary_key', 
+            'sql', 'label', 'group_label', 'description', 'hidden',
+            'tags', 'format', 'display_order', 'primary_key', 
             'aggregate_type', 'timeframes'
         ]
         
@@ -540,13 +597,12 @@ with col1:
         "Paste your LookML code here:",
         height=500,
         placeholder="""Example:
-dimension: parking_action_id {
-  label: "Parking Action ID"
-  description: "Id of the parking action"
+dimension: marketing_channel {
+  label: "Marketing Channel"
+  description: "Channel where the activity occurred"
   hidden: no
-  primary_key: yes
   type: string
-  sql: ${TABLE}.parking_action_id ;;
+  sql: ${TABLE}.marketing_channel ;;
 }""",
         key="lookml_input",
         label_visibility="collapsed"
@@ -650,6 +706,16 @@ with st.sidebar:
   sql: ${TABLE}.marketing_channel ;;
 }
 
+dimension: status {
+  description: "Status of the parking action"
+  hidden: no
+  type: string
+  sql: case
+          when ${TABLE}.parking_action_status = 'Open' or ${TABLE}.checkout_at is null then 'Open'
+          else ${TABLE}.parking_action_status
+        end;;
+}
+
 dimension_group: checkin {
   type: time
   sql: ${TABLE}.checkin_at ;;
@@ -666,6 +732,12 @@ measure: count {
   label: "Count (Total)"
   type: count
   drill_fields: [pa_drill*]
+}
+
+measure: sum_queued_cxp {
+  type: sum
+  sql: ${queued_cxp} ;;
+  label: "Total Queued CXP"
 }"""
         st.rerun()
 
