@@ -1,8 +1,17 @@
-# 🎈 Blank app template
+# LookML to Omni YAML Converter
 
-A simple Streamlit app template for you to modify!
+A Streamlit app that converts Looker's LookML code to Omni-compatible YAML syntax.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Features
+- Convert dimensions, dimension_groups, and measures
+- Handle complex SQL statements and timeframes
+- Download converted YAML files
+- Clean, intuitive interface
+
+## Usage
+1. Paste your LookML code in the left panel
+2. Click "Convert to Omni"
+3. Copy or download the converted YAML from the right panel
 
 ### How to run it on your own machine
 
