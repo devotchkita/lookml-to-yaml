@@ -900,13 +900,12 @@ with col1:
         "Paste your LookML code here:",
         height=500,
         placeholder="""Example:
-dimension: parking_action_id {
-  label: "Parking Action ID"
-  description: "Id of the parking action"
+  marketing_channel {
+  label: "Marketing Channel"
+  description: "Channel where the activity occurred"
   hidden: no
-  primary_key: yes
   type: string
-  sql: ${TABLE}.parking_action_id ;;
+  sql: ${TABLE}.marketing_channel ;;
 }""",
         key="lookml_input",
         label_visibility="collapsed"
