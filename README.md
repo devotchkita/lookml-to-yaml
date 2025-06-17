@@ -12,6 +12,11 @@ A Streamlit app that converts Looker's LookML code to Omni-compatible YAML synta
 1. Paste your LookML code in the left panel
 2. Click "Convert to Omni"
 3. Copy or download the converted YAML from the right panel
+4. Ability to use Anthropic for enhanced conversion
+
+## Live Demo
+[View App](https://your-app-name.streamlit.app)
+
 
 ### How to run it on your own machine
 
