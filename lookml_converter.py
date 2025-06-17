@@ -438,24 +438,103 @@ class LookMLToOmniConverter:
                 group_label = group_label.strip()
             converted_props['group_label'] = group_label
         
+        # Handle description
+        if 'description' in props:
+            converted_props['description'] = props['description']
+        else:
+            # Add placeholder description based on label or name
+            label = converted_props.get('label', name.replace('_', ' ').title())
+            converted_props['description'] = f"{label}"
+        
+        # Handle common parameters for both dimensions and measures
+        
+        # format parameter
+        if 'value_format' in props:
+            converted_props['format'] = props['value_format']
+        elif 'value_format_name' in props:
+            format_mapping = {
+                'decimal_0': 'NUMBER',
+                'decimal_1': 'NUMBER_1',
+                'decimal_2': 'NUMBER_2',
+                'percent_0': 'PERCENT',
+                'percent_1': 'PERCENT_1',
+                'percent_2': 'PERCENT_2',
+                'usd': 'CURRENCY',
+                'eur': 'EURCURRENCY',
+                'gbp': 'GBPCURRENCY',
+            }
+            converted_props['format'] = format_mapping.get(props['value_format_name'], props['value_format_name'].upper())
+        
         # Handle type for dimensions
-        if obj_type == 'dimension' and 'type' in props:
-            dimension_type = props['type']
-            # Special handling for ID fields
-            if name.endswith('_id') and dimension_type == 'string':
-                converted_props['format'] = 'ID'
-            # yesno becomes boolean in Omni
-            elif dimension_type == 'yesno':
-                # Note: yesno dimensions don't get a type in output
-                pass
+        if obj_type == 'dimension':
+            if 'type' in props:
+                dimension_type = props['type']
+                # Special handling for ID fields
+                if name.endswith('_id') and dimension_type == 'string':
+                    converted_props['format'] = 'ID'
+                # yesno becomes boolean in Omni
+                elif dimension_type == 'yesno':
+                    # Note: yesno dimensions don't get a type in output
+                    pass
+                # number type gets specific format
+                elif dimension_type == 'number' and 'format' not in converted_props:
+                    converted_props['format'] = 'NUMBER'
+            
+            # Handle dimension-specific parameters
+            if 'primary_key' in props and props['primary_key'] in ['yes', True]:
+                converted_props['primary_key'] = True
+            
+            # timeframes for date dimensions
+            if 'timeframes' in props:
+                converted_props['timeframes'] = props['timeframes']
+            
+            # convert_tz
+            if 'convert_tz' in props:
+                converted_props['convert_tz'] = props['convert_tz'] == 'yes' or props['convert_tz'] is True
         
         # Handle hidden property
         if 'hidden' in props:
             if props['hidden'] in ['yes', True]:
                 converted_props['hidden'] = True
-            else:
-                # If explicitly set to 'no', don't add hidden field
-                pass
+            # If explicitly set to 'no', don't add hidden field
+        
+        # tags
+        if 'tags' in props:
+            converted_props['tags'] = props['tags']
+        
+        # links
+        if 'link' in props or 'links' in props:
+            links = props.get('links', props.get('link', []))
+            if not isinstance(links, list):
+                links = [links]
+            converted_props['links'] = links
+        
+        # drill_fields
+        if 'drill_fields' in props and props['drill_fields']:
+            # Filter out any pattern matches like [*drill*]
+            drill_fields = [f for f in props['drill_fields'] if not ('*' in f)]
+            if drill_fields:
+                converted_props['drill_fields'] = drill_fields
+        
+        # suggest_from_field
+        if 'suggest_from_field' in props:
+            converted_props['suggest_from_field'] = props['suggest_from_field']
+        
+        # suggestion_list
+        if 'suggestion_list' in props:
+            converted_props['suggestion_list'] = props['suggestion_list']
+        
+        # order_by_field
+        if 'order_by_field' in props:
+            converted_props['order_by_field'] = props['order_by_field']
+        
+        # display_order
+        if 'display_order' in props:
+            converted_props['display_order'] = props['display_order']
+        
+        # view_label
+        if 'view_label' in props:
+            converted_props['view_label'] = props['view_label']
         
         # For measures, handle special cases
         if obj_type == 'measure':
@@ -476,33 +555,55 @@ class LookMLToOmniConverter:
                     converted_props['aggregate_type'] = 'max'
                 elif measure_type == 'min':
                     converted_props['aggregate_type'] = 'min'
+                elif measure_type == 'median':
+                    converted_props['aggregate_type'] = 'median'
+                elif measure_type == 'list':
+                    converted_props['aggregate_type'] = 'list'
                 # If type is 'number', it's a calculated measure, no aggregate_type
-                elif measure_type == 'number':
-                    pass
             
             # Handle sql_distinct_key -> custom_primary_key_sql
             if 'sql_distinct_key' in props:
                 distinct_key = props['sql_distinct_key'].replace(';;', '').strip()
-                # Transform the reference format
-                if '${' in distinct_key:
-                    # Extract the field reference and prepend with table name
-                    converted_props['custom_primary_key_sql'] = distinct_key.replace('${', '${dbt_prod__prs_tasks.')
-                else:
-                    converted_props['custom_primary_key_sql'] = distinct_key
+                # Just keep the field reference as-is, don't add table prefixes
+                converted_props['custom_primary_key_sql'] = distinct_key
+            
+            # filters for filtered measures
+            if 'filters' in props:
+                converted_props['filters'] = props['filters']
+            
+            # drill_queries
+            if 'drill_queries' in props:
+                converted_props['drill_queries'] = props['drill_queries']
         
         # Handle dimension_group specifics
         if obj_type == 'dimension_group':
-            # For dimension groups, we only keep sql, group_label, and label
-            # Remove timeframes and other time-specific properties
-            pass
+            # For dimension groups, we only keep sql, group_label, label, and description
+            # Remove timeframes and other time-specific properties from output
+            keys_to_keep = ['sql', 'group_label', 'label', 'description']
+            converted_props = {k: v for k, v in converted_props.items() if k in keys_to_keep}
         
-        # Always add description (even if empty)
-        if 'description' in props:
-            converted_props['description'] = props['description']
-        else:
-            # Add placeholder description
-            label = converted_props.get('label', name.replace('_', ' ').title())
-            converted_props['description'] = f"{label}"
+        # Handle required_access_grants
+        if 'required_access_grants' in props:
+            converted_props['required_access_grants'] = props['required_access_grants']
+        
+        # Handle aliases
+        if 'alias' in props:
+            converted_props['aliases'] = [props['alias']] if isinstance(props['alias'], str) else props['alias']
+        elif 'aliases' in props:
+            converted_props['aliases'] = props['aliases']
+        
+        # Handle ignored fields
+        if 'ignored' in props and props['ignored'] in ['yes', True]:
+            converted_props['ignored'] = True
+            
+        # Handle dimension specific: groups, bin_boundaries
+        if obj_type == 'dimension':
+            if 'groups' in props:
+                converted_props['groups'] = props['groups']
+            if 'bin_boundaries' in props:
+                converted_props['bin_boundaries'] = props['bin_boundaries']
+            if 'filter_single_select_only' in props:
+                converted_props['filter_single_select_only'] = props['filter_single_select_only'] in ['yes', True]
         
         # Special case: if the SQL field extracts to IS_THIS_SPRINT_FLAG, use that as the name
         if 'sql' in converted_props and converted_props['sql'] == '"IS_THIS_SPRINT_FLAG"' and name == 'is_this_sprint':
@@ -522,15 +623,22 @@ class LookMLToOmniConverter:
         prompt = f"""You are an expert in converting LookML code to Omni YAML syntax.
 
 Convert the following LookML code to Omni YAML format following these rules:
-- hidden: no → tags: [business_facing]
-- type: yesno → boolean type
+- Extract ${TABLE}."FIELD" to just "FIELD" (with quotes)
+- Keep complex SQL statements (CASE, etc) as-is, just remove ;;
+- hidden: yes → hidden: true
+- type: yesno → don't include type in output
+- type: sum_distinct → aggregate_type: sum_distinct_on
+- sql_distinct_key → custom_primary_key_sql (keep field references as-is, no table prefixes)
 - value_format_name → format
 - measure types (count, sum, etc) → aggregate_type
-- SQL statements should be wrapped in double quotes
 - dimension_groups should be under dimensions in the output
-- timeframes should be formatted as arrays
-- All dimensions must include: sql, label, group_label, description, hidden
-- All measures must include: sql, label, group_label, aggregate_type
+- dimension_groups only keep: sql, label, group_label, description
+- Always include description field (use label as description if not provided)
+- Fields ending with _id should have format: ID
+- Clean up group_label (remove leading spaces)
+- Don't include drill_fields that contain wildcards (*)
+- Convert aliases, tags, links, required_access_grants to arrays if needed
+- Map LookML parameters to Omni equivalents (see documentation)
 
 {"Previous conversion attempt failed with: " + error_msg if error_msg else ""}
 
@@ -598,11 +706,16 @@ Please provide only the converted YAML output without any explanations."""
         lines = []
         indent_str = ' ' * indent
         
-        # Property order for better organization
+        # Property order for better organization - matching Omni documentation order
         property_order = [
             'sql', 'label', 'group_label', 'description', 'format',
-            'hidden', 'aggregate_type', 'custom_primary_key_sql',
-            'tags', 'display_order', 'primary_key', 'timeframes'
+            'aggregate_type', 'custom_primary_key_sql', 'hidden', 
+            'primary_key', 'ignored', 'aliases', 'tags', 
+            'links', 'drill_fields', 'drill_queries', 'filters',
+            'display_order', 'view_label', 'suggest_from_field',
+            'suggestion_list', 'order_by_field', 'required_access_grants',
+            'timeframes', 'convert_tz', 'groups', 'bin_boundaries',
+            'filter_single_select_only', 'colors'
         ]
         
         # Add ordered properties first
