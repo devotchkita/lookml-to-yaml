@@ -408,18 +408,23 @@ class LookMLToOmniConverter:
         # First, handle SQL field which is critical
         if 'sql' in props:
             sql_value = props['sql']
-            # Check if it's a field reference like ${TABLE}."FIELD"
-            if '${TABLE}.' in sql_value and ';;' in sql_value:
-                # Extract just the field name
-                field_match = re.search(r'\$\{TABLE\}\."?([^"]+)"?\s*;;', sql_value)
-                if field_match:
-                    field_name = field_match.group(1)
+            # Check if it's a field reference like ${TABLE}."FIELD" or ${TABLE}.FIELD
+            table_ref_match = re.search(r'\$\{TABLE\}\.("?)([^";]+)("?)', sql_value)
+            if table_ref_match:
+                # Extract the field name with quotes if present
+                quote1 = table_ref_match.group(1)
+                field_name = table_ref_match.group(2)
+                quote2 = table_ref_match.group(3)
+                
+                if quote1 and quote2:  # Field was quoted in original
                     converted_props['sql'] = f'"{field_name}"'
-                else:
-                    converted_props['sql'] = sql_value.replace(';;', '').strip()
+                else:  # Field was not quoted
+                    converted_props['sql'] = f'"{field_name}"'  # Always quote in output
             else:
                 # For CASE statements and other SQL, keep as is but remove ;;
-                converted_props['sql'] = sql_value.replace(';;', '').strip()
+                sql_cleaned = sql_value.replace(';;', '').strip()
+                # Don't add quotes to complex SQL
+                converted_props['sql'] = sql_cleaned
         
         # Handle label
         if 'label' in props:
