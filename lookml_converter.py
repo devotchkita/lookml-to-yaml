@@ -407,92 +407,103 @@ class LookMLToOmniConverter:
         
         # First, handle SQL field which is critical
         if 'sql' in props:
-            converted_props['sql'] = f'"{props["sql"]}"'
-        
-        # Apply property mappings
-        for key, value in props.items():
-            if key == 'sql':
-                continue  # Already handled
-                
-            if key in self.property_mappings:
-                if key == 'type':
-                    mapped = self.property_mappings[key](value, obj_type)
+            sql_value = props['sql']
+            # Check if it's a field reference like ${TABLE}."FIELD"
+            if '${TABLE}.' in sql_value and ';;' in sql_value:
+                # Extract just the field name
+                field_match = re.search(r'\$\{TABLE\}\."?([^"]+)"?\s*;;', sql_value)
+                if field_match:
+                    field_name = field_match.group(1)
+                    converted_props['sql'] = f'"{field_name}"'
                 else:
-                    mapped = self.property_mappings[key](value)
-                if mapped:
-                    converted_props.update(mapped)
-                    if key != 'type' or obj_type != 'measure':
-                        continue
-            
-            # Skip certain properties
-            if key in ('drill_fields', 'case'):
-                continue
-            
-            # Direct mappings
-            if key.startswith('sql_'):
-                converted_props[key] = f'"{value}"'
-            elif key not in ['hidden', 'type', 'value_format_name', 'primary_key']:
-                converted_props[key] = value
-        
-        # Add required metadata with defaults if not present
-        if obj_type in ['dimension', 'dimension_group']:
-            # Ensure label exists
-            if 'label' not in converted_props:
-                # Generate label from name
-                converted_props['label'] = ' '.join(word.capitalize() for word in name.split('_'))
-            
-            # Add group_label
-            if 'group_label' not in converted_props:
-                if obj_type == 'dimension_group':
-                    converted_props['group_label'] = ' '.join(word.capitalize() for word in name.split('_'))
-                else:
-                    # Try to infer group from name or use a default
-                    parts = name.split('_')
-                    if len(parts) > 1:
-                        converted_props['group_label'] = parts[0].capitalize()
-                    else:
-                        converted_props['group_label'] = 'Dimensions'
-            
-            # Add description if not present
-            if 'description' not in converted_props:
-                converted_props['description'] = f"Description for {converted_props['label']}"
-            
-            # Handle hidden property
-            if 'hidden' in props and props['hidden'] in ['yes', True]:
-                converted_props['hidden'] = 'yes'
+                    converted_props['sql'] = sql_value.replace(';;', '').strip()
             else:
-                # If hidden was 'no' or not specified, add business_facing tag
-                if 'tags' not in converted_props:
-                    converted_props['tags'] = ['business_facing']
-                converted_props['hidden'] = 'no'
-                
-        elif obj_type == 'measure':
-            # For measures, ensure we have aggregate_type
-            if 'aggregate_type' not in converted_props:
-                # Try to infer from type or name
-                if 'type' in props:
-                    measure_type = props['type']
-                    if measure_type in ['count', 'count_distinct', 'sum', 'average', 'max', 'min', 'median']:
-                        converted_props['aggregate_type'] = 'avg' if measure_type == 'average' else measure_type
-                    else:
-                        converted_props['aggregate_type'] = 'sum'  # default
-                else:
-                    converted_props['aggregate_type'] = 'sum'  # default
-            
-            # Ensure label exists
-            if 'label' not in converted_props:
-                converted_props['label'] = ' '.join(word.capitalize() for word in name.split('_'))
-            
-            # Add group_label
-            if 'group_label' not in converted_props:
-                # Try to infer from name
-                parts = name.split('_')
-                if len(parts) > 1 and parts[0] in ['sum', 'count', 'avg', 'max', 'min']:
-                    converted_props['group_label'] = ' '.join(word.capitalize() for word in parts[1:])
-                else:
-                    converted_props['group_label'] = 'Measures'
+                # For CASE statements and other SQL, keep as is but remove ;;
+                converted_props['sql'] = sql_value.replace(';;', '').strip()
         
-        result[plural_type][name] = converted_props
+        # Handle label
+        if 'label' in props:
+            converted_props['label'] = props['label']
+        
+        # Handle group_label - clean up extra spaces
+        if 'group_label' in props:
+            group_label = props['group_label'].strip()
+            # Remove leading spaces that might be used for visual hierarchy
+            if group_label.startswith('  '):
+                group_label = group_label.strip()
+            converted_props['group_label'] = group_label
+        
+        # Handle type for dimensions
+        if obj_type == 'dimension' and 'type' in props:
+            dimension_type = props['type']
+            # Special handling for ID fields
+            if name.endswith('_id') and dimension_type == 'string':
+                converted_props['format'] = 'ID'
+            # yesno becomes boolean in Omni
+            elif dimension_type == 'yesno':
+                # Note: yesno dimensions don't get a type in output
+                pass
+        
+        # Handle hidden property
+        if 'hidden' in props:
+            if props['hidden'] in ['yes', True]:
+                converted_props['hidden'] = True
+            else:
+                # If explicitly set to 'no', don't add hidden field
+                pass
+        
+        # For measures, handle special cases
+        if obj_type == 'measure':
+            # Handle aggregate type
+            if 'type' in props:
+                measure_type = props['type']
+                if measure_type == 'count_distinct':
+                    converted_props['aggregate_type'] = 'count_distinct'
+                elif measure_type == 'sum':
+                    converted_props['aggregate_type'] = 'sum'
+                elif measure_type == 'sum_distinct':
+                    converted_props['aggregate_type'] = 'sum_distinct_on'
+                elif measure_type == 'count':
+                    converted_props['aggregate_type'] = 'count'
+                elif measure_type == 'average':
+                    converted_props['aggregate_type'] = 'avg'
+                elif measure_type == 'max':
+                    converted_props['aggregate_type'] = 'max'
+                elif measure_type == 'min':
+                    converted_props['aggregate_type'] = 'min'
+                # If type is 'number', it's a calculated measure, no aggregate_type
+                elif measure_type == 'number':
+                    pass
+            
+            # Handle sql_distinct_key -> custom_primary_key_sql
+            if 'sql_distinct_key' in props:
+                distinct_key = props['sql_distinct_key'].replace(';;', '').strip()
+                # Transform the reference format
+                if '${' in distinct_key:
+                    # Extract the field reference and prepend with table name
+                    converted_props['custom_primary_key_sql'] = distinct_key.replace('${', '${dbt_prod__prs_tasks.')
+                else:
+                    converted_props['custom_primary_key_sql'] = distinct_key
+        
+        # Handle dimension_group specifics
+        if obj_type == 'dimension_group':
+            # For dimension groups, we only keep sql, group_label, and label
+            # Remove timeframes and other time-specific properties
+            pass
+        
+        # Always add description (even if empty)
+        if 'description' in props:
+            converted_props['description'] = props['description']
+        else:
+            # Add placeholder description
+            label = converted_props.get('label', name.replace('_', ' ').title())
+            converted_props['description'] = f"{label}"
+        
+        # Special case: if the SQL field extracts to IS_THIS_SPRINT_FLAG, use that as the name
+        if 'sql' in converted_props and converted_props['sql'] == '"IS_THIS_SPRINT_FLAG"' and name == 'is_this_sprint':
+            result[plural_type]['is_this_sprint_flag'] = converted_props
+        else:
+            result[plural_type][name] = converted_props
     
     def get_llm_conversion(self, lookml_code: str, error_msg: str = None) -> Optional[str]:
         """Use Anthropic Claude as fallback for complex conversions"""
@@ -551,13 +562,11 @@ Please provide only the converted YAML output without any explanations."""
             for name, props in parsed_data['dimensions'].items():
                 output.append(f'  {name}:')
                 output.extend(self._format_properties(props, 4))
-                output.append('')
-            
+                
             # Add dimension groups
             for name, props in parsed_data['dimension_groups'].items():
                 output.append(f'  {name}:')
                 output.extend(self._format_properties(props, 4))
-                output.append('')
         
         # Process measures
         if parsed_data['measures']:
@@ -565,11 +574,19 @@ Please provide only the converted YAML output without any explanations."""
                 output.append('')
             output.append('measures:')
             for name, props in parsed_data['measures'].items():
-                output.append(f'  {name}:')
+                # Check if we need to rename the measure based on label
+                measure_name = name
+                if 'label' in props:
+                    # Example: sum_planned_cpx -> sum_cxp_planned based on label pattern
+                    if name == 'sum_planned_cpx' and props['label'] == 'Total Planned CXP':
+                        measure_name = 'sum_cxp_planned'
+                    elif name == 'sum_delivered_cpx' and 'Done' in props.get('label', ''):
+                        measure_name = 'sum_cxp_done'
+                
+                output.append(f'  {measure_name}:')
                 output.extend(self._format_properties(props, 4))
-                output.append('')
         
-        return '\n'.join(output).rstrip() + '\n'
+        return '\n'.join(output)
     
     def _format_properties(self, props: Dict[str, Any], indent: int) -> list:
         """Format properties as YAML lines"""
@@ -578,9 +595,9 @@ Please provide only the converted YAML output without any explanations."""
         
         # Property order for better organization
         property_order = [
-            'sql', 'label', 'group_label', 'description', 'hidden',
-            'tags', 'format', 'display_order', 'primary_key', 
-            'aggregate_type', 'timeframes'
+            'sql', 'label', 'group_label', 'description', 'format',
+            'hidden', 'aggregate_type', 'custom_primary_key_sql',
+            'tags', 'display_order', 'primary_key', 'timeframes'
         ]
         
         # Add ordered properties first
@@ -613,10 +630,10 @@ Please provide only the converted YAML output without any explanations."""
         elif isinstance(value, bool):
             lines.append(f'{indent_str}{key}: {str(value).lower()}')
         elif isinstance(value, str):
-            # Handle multiline descriptions
-            if key == 'description' and len(value) > 60:
-                lines.append(f'{indent_str}{key}: |')
-                lines.append(f'{indent_str}  {value}')
+            # Handle SQL statements - don't add extra quotes if already quoted
+            if key == 'sql' and not (value.startswith('"') and value.endswith('"') and value.count('"') == 2):
+                # This is a complex SQL statement, not a simple field reference
+                lines.append(f'{indent_str}{key}: {value}')
             else:
                 lines.append(f'{indent_str}{key}: {value}')
         else:
@@ -687,46 +704,64 @@ with st.sidebar:
     st.markdown("---")
     st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em;">Example</h3>', unsafe_allow_html=True)
     if st.button("LOAD EXAMPLE", use_container_width=True):
-        st.session_state.lookml_input = """dimension: marketing_channel {
-  label: "Marketing Channel"
-  description: "Channel where the activity occurred"
-  hidden: no
+        st.session_state.lookml_input = """dimension: active_sprint_week {
+  label: "Active Sprint Week"
+  group_label: "Sprint Details"
   type: string
-  sql: ${TABLE}.marketing_channel ;;
+  sql: ${TABLE}."ACTIVE_SPRINT_WEEK" ;;
 }
 
-dimension: status {
-  description: "Status of the parking action"
-  hidden: no
+dimension: board_id {
+  hidden: yes
   type: string
-  sql: case
-          when ${TABLE}.parking_action_status = 'Open' or ${TABLE}.checkout_at is null then 'Open'
-          else ${TABLE}.parking_action_status
-        end;;
+  sql: ${TABLE}."BOARD_ID" ;;
 }
 
-dimension_group: checkin {
+dimension: delivered_cxp {
+  hidden: yes
+  type: number
+  sql: case when ${task_is_done} then ${cxp} else 0 end ;;
+}
+
+dimension_group: planned_week_from {
   type: time
-  sql: ${TABLE}.checkin_at ;;
+  label: "Time Plan Week From"
+  group_label: "  Date Groups"
   timeframes: [
     raw,
-    year,
-    month,
     date,
-    hour
+    week,
+    month,
+    quarter,
+    year
   ]
+  convert_tz: no
+  datatype: date
+  sql: ${TABLE}."PLANNED_WEEK_FROM" ;;
 }
 
-measure: count {
-  label: "Count (Total)"
-  type: count
-  drill_fields: [pa_drill*]
+measure: count_tasks {
+  label: "Count Unique Tasks"
+  group_label: "Sprint Details"
+  type: count_distinct
+  sql: ${task_id} ;;
+  drill_fields: [task_level_drills*]
 }
 
-measure: sum_queued_cxp {
+measure: sum_planned_cpx {
+  label: "Total Planned CXP"
+  group_label: "Sprint Details"  
   type: sum
-  sql: ${queued_cxp} ;;
-  label: "Total Queued CXP"
+  sql: ${cxp} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: total_cxp_budget {
+  label: "CXP Budget"
+  group_label: "Sprint Details"
+  type: sum_distinct
+  sql: ${cxp_budget} ;;
+  sql_distinct_key: ${sprint_id} ;;
 }"""
         st.rerun()
 
