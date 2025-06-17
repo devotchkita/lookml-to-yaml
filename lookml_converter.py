@@ -748,11 +748,17 @@ Please provide only the converted YAML output without any explanations."""
         elif isinstance(value, bool):
             lines.append(f'{indent_str}{key}: {str(value).lower()}')
         elif isinstance(value, str):
-            # Handle SQL statements - don't add extra quotes if already quoted
-            if key == 'sql' and not (value.startswith('"') and value.endswith('"') and value.count('"') == 2):
-                # This is a complex SQL statement, not a simple field reference
-                lines.append(f'{indent_str}{key}: {value}')
+            # Special handling for SQL fields
+            if key == 'sql':
+                # Check if it's already a simple quoted field reference
+                if value.startswith('"') and value.endswith('"') and value.count('"') == 2:
+                    # It's already properly quoted, output with single quotes around the whole thing
+                    lines.append(f"{indent_str}{key}: '{value}'")
+                else:
+                    # It's complex SQL (CASE statements, etc.), output as-is
+                    lines.append(f'{indent_str}{key}: {value}')
             else:
+                # For all other string properties
                 lines.append(f'{indent_str}{key}: {value}')
         else:
             lines.append(f'{indent_str}{key}: {value}')
