@@ -1,13 +1,15 @@
 import streamlit as st
 import re
 from typing import Dict, Any, Optional, Tuple
+import os
+import anthropic
 
 # Page configuration
 st.set_page_config(
     page_title="LookML to Omni YAML Converter - Tasman",
     page_icon="🔄",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # Custom CSS following Tasman brand guidelines
@@ -188,14 +190,6 @@ st.markdown("""
         background: #cccccc;
     }
 </style>
-""", unsafe_allow_html=True)
-
-# Header with Tasman branding
-st.markdown("""
-<div class="main-header">
-    <h1 style="margin: 0; font-size: 3rem; font-weight: normal;">TASMAN</h1>
-    <p style="margin: 1rem 0 0 0; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.8;">LOOKML TO OMNI YAML CONVERTER</p>
-</div>
 """, unsafe_allow_html=True)
 
 class LookMLToOmniConverter:
@@ -500,6 +494,51 @@ class LookMLToOmniConverter:
         
         result[plural_type][name] = converted_props
     
+    def get_llm_conversion(self, lookml_code: str, error_msg: str = None) -> Optional[str]:
+        """Use Anthropic Claude as fallback for complex conversions"""
+        
+        # Check if API key is available
+        anthropic_key = st.session_state.get('anthropic_api_key', os.getenv('ANTHROPIC_API_KEY'))
+        
+        if not anthropic_key:
+            return None
+            
+        prompt = f"""You are an expert in converting LookML code to Omni YAML syntax.
+
+Convert the following LookML code to Omni YAML format following these rules:
+- hidden: no → tags: [business_facing]
+- type: yesno → boolean type
+- value_format_name → format
+- measure types (count, sum, etc) → aggregate_type
+- SQL statements should be wrapped in double quotes
+- dimension_groups should be under dimensions in the output
+- timeframes should be formatted as arrays
+- All dimensions must include: sql, label, group_label, description, hidden
+- All measures must include: sql, label, group_label, aggregate_type
+
+{"Previous conversion attempt failed with: " + error_msg if error_msg else ""}
+
+LookML code:
+{lookml_code}
+
+Please provide only the converted YAML output without any explanations."""
+
+        try:
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=2000,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text.strip()
+                
+        except Exception as e:
+            st.error(f"LLM conversion failed: {str(e)}")
+            return None
+    
     def convert_to_yaml(self, parsed_data: Dict[str, Any]) -> str:
         """Convert parsed data to YAML format"""
         output = []
@@ -588,79 +627,29 @@ class LookMLToOmniConverter:
 # Initialize converter
 converter = LookMLToOmniConverter()
 
-# Create two columns for input and output
-col1, col2 = st.columns(2, gap="medium")
-
-with col1:
-    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">LookML Input</h2>', unsafe_allow_html=True)
-    lookml_input = st.text_area(
-        "Paste your LookML code here:",
-        height=500,
-        placeholder="""Example:
-dimension: marketing_channel {
-  label: "Marketing Channel"
-  description: "Channel where the activity occurred"
-  hidden: no
-  type: string
-  sql: ${TABLE}.marketing_channel ;;
-}""",
-        key="lookml_input",
-        label_visibility="collapsed"
-    )
-
-with col2:
-    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">Omni YAML Output</h2>', unsafe_allow_html=True)
-    omni_output_placeholder = st.empty()
-
-# Buttons row
-button_col1, button_col2, button_col3 = st.columns([2, 1, 1], gap="small")
-
-with button_col1:
-    convert_button = st.button("CONVERT TO OMNI", type="primary", use_container_width=True)
-
-with button_col2:
-    clear_button = st.button("CLEAR ALL", use_container_width=True)
-
-with button_col3:
-    # Create a placeholder for the copy button feedback
-    copy_feedback = st.empty()
-
-# Handle conversion
-if convert_button and lookml_input:
-    try:
-        # Parse and convert
-        parsed_data = converter.parse_lookml(lookml_input)
-        omni_yaml = converter.convert_to_yaml(parsed_data)
-        
-        # Display output
-        with col2:
-            st.text_area(
-                "Converted YAML:",
-                value=omni_yaml,
-                height=500,
-                key="omni_output",
-                label_visibility="collapsed"
-            )
-            
-            # Download button
-            st.download_button(
-                label="DOWNLOAD YAML",
-                data=omni_yaml,
-                file_name="omni_config.yaml",
-                mime="text/yaml"
-            )
-        
-        st.success("✅ Conversion successful!")
-        
-    except Exception as e:
-        st.error(f"❌ Error during conversion: {str(e)}")
-
-# Handle clear button
-if clear_button:
-    st.rerun()
-
-# Show example in sidebar
+# Sidebar content
 with st.sidebar:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">AI Enhancement</h2>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; font-size: 0.875rem; margin-bottom: 1rem;">
+    Optional: Add an Anthropic API key for enhanced conversion using Claude when the standard conversion fails.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # API key input
+    anthropic_key = st.text_input("Anthropic API Key:", type="password", key="anthropic_api_key_input")
+    if anthropic_key:
+        st.session_state['anthropic_api_key'] = anthropic_key
+    
+    # Check if key is set via environment variable
+    if os.getenv('ANTHROPIC_API_KEY') and not anthropic_key:
+        st.success("✅ API key loaded from environment")
+    elif anthropic_key:
+        st.success("✅ API key set")
+    
+    st.markdown("---")
+    
     st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">How to Use</h2>', unsafe_allow_html=True)
     st.markdown("""
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; line-height: 1.4;">
@@ -740,6 +729,125 @@ measure: sum_queued_cxp {
   label: "Total Queued CXP"
 }"""
         st.rerun()
+
+# Header with Tasman branding
+st.markdown("""
+<div class="main-header">
+    <h1 style="margin: 0; font-size: 3rem; font-weight: normal; color: #ffffff;">TASMAN</h1>
+    <p style="margin: 1rem 0 0 0; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.8; color: #ffffff;">LOOKML TO OMNI YAML CONVERTER</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Main content area
+col1, col2 = st.columns(2, gap="medium")
+
+with col1:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">LookML Input</h2>', unsafe_allow_html=True)
+    lookml_input = st.text_area(
+        "Paste your LookML code here:",
+        height=500,
+        placeholder="""Example:
+dimension: parking_action_id {
+  label: "Parking Action ID"
+  description: "Id of the parking action"
+  hidden: no
+  primary_key: yes
+  type: string
+  sql: ${TABLE}.parking_action_id ;;
+}""",
+        key="lookml_input",
+        label_visibility="collapsed"
+    )
+
+with col2:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">Omni YAML Output</h2>', unsafe_allow_html=True)
+    omni_output_placeholder = st.empty()
+
+# Buttons row
+button_col1, button_col2, button_col3 = st.columns([2, 1, 1], gap="small")
+
+with button_col1:
+    convert_button = st.button("CONVERT TO OMNI", type="primary", use_container_width=True)
+
+with button_col2:
+    clear_button = st.button("CLEAR ALL", use_container_width=True)
+
+with button_col3:
+    copy_feedback = st.empty()
+
+# Handle conversion
+if convert_button and lookml_input:
+    try:
+        # First try rule-based conversion
+        with st.spinner("Converting with rule-based engine..."):
+            parsed_data = converter.parse_lookml(lookml_input)
+            omni_yaml = converter.convert_to_yaml(parsed_data)
+        
+        # Check if conversion produced meaningful output
+        if not omni_yaml.strip() or omni_yaml.strip() == "dimensions:\n\nmeasures:":
+            # Try LLM conversion if available
+            if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+                with st.spinner("Rule-based conversion incomplete. Trying AI-powered conversion..."):
+                    llm_result = converter.get_llm_conversion(lookml_input, "Empty or incomplete output")
+                    if llm_result:
+                        omni_yaml = llm_result
+                        st.info("🤖 AI-powered conversion used for better results")
+            else:
+                st.warning("⚠️ Conversion produced limited output. Consider adding an Anthropic API key for AI-enhanced conversion.")
+        
+        # Display output
+        with col2:
+            st.text_area(
+                "Converted YAML:",
+                value=omni_yaml,
+                height=500,
+                key="omni_output",
+                label_visibility="collapsed"
+            )
+            
+            # Download button
+            st.download_button(
+                label="DOWNLOAD YAML",
+                data=omni_yaml,
+                file_name="omni_config.yaml",
+                mime="text/yaml"
+            )
+        
+        st.success("✅ Conversion successful!")
+        
+    except Exception as e:
+        # Try LLM conversion on error
+        if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+            with st.spinner("Standard conversion failed. Trying AI-powered conversion..."):
+                llm_result = converter.get_llm_conversion(lookml_input, str(e))
+                if llm_result:
+                    with col2:
+                        st.text_area(
+                            "Converted YAML:",
+                            value=llm_result,
+                            height=500,
+                            key="omni_output",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Download button
+                        st.download_button(
+                            label="DOWNLOAD YAML",
+                            data=llm_result,
+                            file_name="omni_config.yaml",
+                            mime="text/yaml"
+                        )
+                    
+                    st.success("✅ AI-powered conversion successful!")
+                else:
+                    st.error(f"❌ Both standard and AI conversion failed: {str(e)}")
+        else:
+            st.error(f"❌ Conversion failed: {str(e)}")
+            st.info("💡 Tip: Add an Anthropic API key in the sidebar to enable AI-powered fallback conversion.")
+
+# Handle clear button
+if clear_button:
+    st.rerun()
 
 # Footer
 st.markdown("---")
