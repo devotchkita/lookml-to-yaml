@@ -202,6 +202,8 @@ class LookMLToOmniConverter:
             'value_format_name': self._map_value_format,
             'type': self._map_type,
         }
+        # Track parameters for filter creation
+        self.parameters = {}
         
     def _map_hidden(self, value: Any) -> Optional[Dict[str, Any]]:
         """Map hidden property to tags"""
@@ -254,7 +256,9 @@ class LookMLToOmniConverter:
         result = {
             'dimensions': {},
             'dimension_groups': {},
-            'measures': {}
+            'measures': {},
+            'parameters': {},
+            'filters': {}
         }
         
         current_object = None
@@ -267,6 +271,9 @@ class LookMLToOmniConverter:
         in_sql = False
         sql_lines = []
         sql_key = None
+        in_allowed_value = False
+        allowed_values = []
+        current_allowed_value = {}
         
         for i, line in enumerate(lines):
             trimmed = line.strip()
@@ -279,6 +286,7 @@ class LookMLToOmniConverter:
             dimension_match = re.match(r'^dimension:\s*(\w+)\s*{', trimmed)
             dimension_group_match = re.match(r'^dimension_group:\s*(\w+)\s*{', trimmed)
             measure_match = re.match(r'^measure:\s*(\w+)\s*{', trimmed)
+            parameter_match = re.match(r'^parameter:\s*(\w+)\s*{', trimmed)
             
             if dimension_match:
                 if current_object and current_type:
@@ -298,8 +306,19 @@ class LookMLToOmniConverter:
                 current_object = measure_match.group(1)
                 current_type = 'measure'
                 current_props = {}
+            elif parameter_match:
+                if current_object and current_type:
+                    self._save_object(result, current_type, current_object, current_props)
+                current_object = parameter_match.group(1)
+                current_type = 'parameter'
+                current_props = {}
             elif trimmed == '}':
-                if in_case and case_depth > 0:
+                if in_allowed_value:
+                    if 'value' in current_allowed_value:
+                        allowed_values.append(current_allowed_value)
+                    current_allowed_value = {}
+                    in_allowed_value = False
+                elif in_case and case_depth > 0:
                     case_depth -= 1
                     if case_depth == 0:
                         in_case = False
@@ -307,9 +326,24 @@ class LookMLToOmniConverter:
                     in_timeframes = False
                     current_props['timeframes'] = timeframes_list
                     timeframes_list = []
+                elif current_props and 'allowed_value' in current_props:
+                    # End of parameter with allowed_values
+                    current_props['allowed_values'] = allowed_values
+                    allowed_values = []
+                    del current_props['allowed_value']
             elif trimmed == 'case: {':
                 in_case = True
                 case_depth = 1
+            elif trimmed == 'allowed_value: {':
+                in_allowed_value = True
+            elif in_allowed_value:
+                # Parse allowed_value properties
+                if '{' in trimmed:
+                    continue
+                prop = self._parse_property(trimmed)
+                if prop:
+                    key, value = prop
+                    current_allowed_value[key] = value
             elif in_case:
                 if '{' in trimmed:
                     case_depth += 1
@@ -319,7 +353,783 @@ class LookMLToOmniConverter:
                 in_timeframes = True
             elif in_timeframes:
                 # Extract timeframe values
-                tf_match = re.match(r'^(\w+),?$', trimmed)
+                tf_match = re.match(r'^(\w+),?
+    
+    def _convert_parameters_to_filters(self, result: Dict[str, Any]):
+        """Convert LookML parameters to Omni filters"""
+        if 'parameters' in result and result['parameters']:
+            for param_name, param_props in result['parameters'].items():
+                filter_props = {}
+                
+                # Basic properties
+                if 'label' in param_props:
+                    filter_props['label'] = param_props['label']
+                if 'description' in param_props:
+                    filter_props['description'] = param_props['description']
+                
+                # Type is always string for filters
+                filter_props['type'] = 'string'
+                
+                # Convert allowed_values to suggestion_list
+                if 'allowed_values' in param_props:
+                    suggestion_list = []
+                    for av in param_props['allowed_values']:
+                        if 'value' in av:
+                            suggestion_list.append({'value': av['value']})
+                    if suggestion_list:
+                        filter_props['suggestion_list'] = suggestion_list
+                
+                # Handle default_value
+                if 'default_value' in param_props:
+                    filter_props['default_filter'] = {'is': param_props['default_value']}
+                
+                result['filters'][param_name] = filter_props
+        """Parse a property line"""
+        # Handle timeframes array in single line
+        timeframes_match = re.match(r'timeframes:\s*\[(.*?)\]', line)
+        if timeframes_match:
+            timeframes = [t.strip() for t in timeframes_match.group(1).split(',')]
+            return ('timeframes', timeframes)
+        
+        # Handle regular properties
+        match = re.match(r'^(\w+):\s*(.+?)(?:\s*;;)?$', line)
+        if match:
+            key = match.group(1)
+            value = match.group(2).strip()
+            
+            # Remove trailing semicolons
+            value = re.sub(r'\s*;;\s*$', '', value)
+            
+            # Handle quoted values
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            
+            # Convert boolean values
+            if value in ('yes', 'true'):
+                value = True
+            elif value in ('no', 'false'):
+                value = False
+            
+            return (key, value)
+        
+        return None
+    
+    def _save_object(self, result: Dict, obj_type: str, name: str, props: Dict[str, Any]):
+        """Save parsed object to result"""
+        plural_type = obj_type + 's'
+        if obj_type == 'dimension_group':
+            plural_type = 'dimensions'  # dimension_groups go under dimensions in the output
+        
+        converted_props = {}
+        
+        # First, handle SQL field which is critical
+        if 'sql' in props:
+            sql_value = props['sql']
+            # Check if it's a field reference like ${TABLE}."FIELD" or ${TABLE}.FIELD
+            table_ref_match = re.search(r'\$\{TABLE\}\.("?)([^";]+)("?)', sql_value)
+            if table_ref_match:
+                # Extract the field name with quotes if present
+                quote1 = table_ref_match.group(1)
+                field_name = table_ref_match.group(2)
+                quote2 = table_ref_match.group(3)
+                
+                if quote1 and quote2:  # Field was quoted in original
+                    converted_props['sql'] = f'"{field_name}"'
+                else:  # Field was not quoted
+                    converted_props['sql'] = f'"{field_name}"'  # Always quote in output
+            else:
+                # For CASE statements and other SQL, keep as is but remove ;;
+                sql_cleaned = sql_value.replace(';;', '').strip()
+                # Don't add quotes to complex SQL
+                converted_props['sql'] = sql_cleaned
+        
+        # Handle label
+        if 'label' in props:
+            converted_props['label'] = props['label']
+        
+        # Handle group_label - clean up extra spaces
+        if 'group_label' in props:
+            group_label = props['group_label'].strip()
+            # Remove leading spaces that might be used for visual hierarchy
+            if group_label.startswith('  '):
+                group_label = group_label.strip()
+            converted_props['group_label'] = group_label
+        
+        # Handle description
+        if 'description' in props:
+            converted_props['description'] = props['description']
+        else:
+            # Add placeholder description based on label or name
+            label = converted_props.get('label', name.replace('_', ' ').title())
+            converted_props['description'] = f"{label}"
+        
+        # Handle common parameters for both dimensions and measures
+        
+                # format parameter
+        if 'value_format' in props:
+            converted_props['format'] = props['value_format']
+        elif 'value_format_name' in props:
+            format_mapping = {
+                'decimal_0': 'NUMBER',
+                'decimal_1': 'NUMBER_1',
+                'decimal_2': 'NUMBER_2',
+                'percent_0': 'PERCENT',
+                'percent_1': 'PERCENT_1',
+                'percent_2': 'PERCENT_2',
+                'usd': 'CURRENCY',
+                'usd_0': 'CURRENCY',
+                'eur': 'EURCURRENCY',
+                'gbp': 'GBPCURRENCY',
+                # Add more format mappings based on examples
+                'id': 'ID',
+                'string': 'STRING',
+            }
+            converted_props['format'] = format_mapping.get(props['value_format_name'], props['value_format_name'].upper())
+        
+        # Handle type for dimensions
+        if obj_type == 'dimension':
+            if 'type' in props:
+                dimension_type = props['type']
+                # Special handling for ID fields
+                if name.endswith('_id') and dimension_type == 'string':
+                    converted_props['format'] = 'ID'
+                # Handle _sk fields (surrogate keys)
+                elif name.endswith('_sk'):
+                    converted_props['format'] = 'ID'
+                # yesno becomes boolean in Omni
+                elif dimension_type == 'yesno':
+                    # Note: yesno dimensions don't get a type in output
+                    pass
+                # number type gets specific format
+                elif dimension_type == 'number' and 'format' not in converted_props:
+                    converted_props['format'] = 'NUMBER'
+                # time dimensions
+                elif dimension_type == 'time':
+                    # Time dimensions are handled as dimension_groups
+                    pass
+            
+            # Handle dimension-specific parameters
+            if 'primary_key' in props and props['primary_key'] in ['yes', True]:
+                converted_props['primary_key'] = True
+            
+            # timeframes for date dimensions
+            if 'timeframes' in props:
+                converted_props['timeframes'] = props['timeframes']
+            
+            # convert_tz
+            if 'convert_tz' in props:
+                converted_props['convert_tz'] = props['convert_tz'] == 'yes' or props['convert_tz'] is True
+        
+        # Handle hidden property
+        if 'hidden' in props:
+            if props['hidden'] in ['yes', True]:
+                converted_props['hidden'] = True
+            elif props['hidden'] in ['no', False]:
+                # Don't add hidden field if it's explicitly set to 'no'
+                pass
+        
+        # tags - only add if explicitly defined in LookML
+        if 'tags' in props:
+            # Ensure tags is always a list
+            if isinstance(props['tags'], str):
+                converted_props['tags'] = [props['tags']]
+            elif isinstance(props['tags'], list):
+                converted_props['tags'] = props['tags']
+            else:
+                converted_props['tags'] = [str(props['tags'])]
+        
+        # links
+        if 'link' in props or 'links' in props:
+            links = props.get('links', props.get('link', []))
+            if not isinstance(links, list):
+                links = [links]
+            converted_props['links'] = links
+        
+        # drill_fields
+        if 'drill_fields' in props and props['drill_fields']:
+            # Filter out any pattern matches like [*drill*]
+            drill_fields = [f for f in props['drill_fields'] if not ('*' in f)]
+            if drill_fields:
+                converted_props['drill_fields'] = drill_fields
+        
+        # suggest_from_field
+        if 'suggest_from_field' in props:
+            converted_props['suggest_from_field'] = props['suggest_from_field']
+        
+        # suggestion_list
+        if 'suggestion_list' in props:
+            converted_props['suggestion_list'] = props['suggestion_list']
+        elif 'suggestions' in props:
+            # Convert suggestions to suggestion_list format
+            converted_props['suggestion_list'] = props['suggestions']
+        
+        # order_by_field
+        if 'order_by_field' in props:
+            converted_props['order_by_field'] = props['order_by_field']
+        
+        # display_order
+        if 'display_order' in props:
+            converted_props['display_order'] = props['display_order']
+        
+        # view_label
+        if 'view_label' in props:
+            converted_props['view_label'] = props['view_label']
+        
+        # For measures, handle special cases
+        if obj_type == 'measure':
+            # Handle aggregate type
+            if 'type' in props:
+                measure_type = props['type']
+                if measure_type == 'count_distinct':
+                    converted_props['aggregate_type'] = 'count_distinct'
+                elif measure_type == 'sum':
+                    converted_props['aggregate_type'] = 'sum'
+                elif measure_type == 'sum_distinct':
+                    converted_props['aggregate_type'] = 'sum_distinct_on'
+                elif measure_type == 'count':
+                    converted_props['aggregate_type'] = 'count'
+                elif measure_type == 'average':
+                    converted_props['aggregate_type'] = 'avg'
+                elif measure_type == 'max':
+                    converted_props['aggregate_type'] = 'max'
+                elif measure_type == 'min':
+                    converted_props['aggregate_type'] = 'min'
+                elif measure_type == 'median':
+                    converted_props['aggregate_type'] = 'median'
+                elif measure_type == 'list':
+                    converted_props['aggregate_type'] = 'list'
+                # If type is 'number', it's a calculated measure, no aggregate_type
+            
+            # Handle sql_distinct_key -> custom_primary_key_sql
+            if 'sql_distinct_key' in props:
+                distinct_key = props['sql_distinct_key'].replace(';;', '').strip()
+                # Just keep the field reference as-is, don't add table prefixes
+                converted_props['custom_primary_key_sql'] = distinct_key
+            
+            # filters for filtered measures
+            if 'filters' in props:
+                converted_props['filters'] = props['filters']
+            
+            # Handle view_label (special case - comes from file level)
+            if 'view_label' in props:
+                converted_props['view_label'] = props['view_label']
+            
+            # Handle measure-specific format mappings
+            if 'format' not in converted_props and 'label' in props:
+                # Infer format from label or name patterns
+                label_lower = props['label'].lower()
+                if any(word in label_lower for word in ['count', 'number', 'num']):
+                    converted_props['format'] = 'big_2'  # Common format for counts
+        
+        # Handle dimension_group specifics
+        if obj_type == 'dimension_group':
+            # For dimension groups, we only keep sql, group_label, label, and description
+            # Remove timeframes and other time-specific properties from output
+            keys_to_keep = ['sql', 'group_label', 'label', 'description']
+            converted_props = {k: v for k, v in converted_props.items() if k in keys_to_keep}
+        
+        # Handle required_access_grants
+        if 'required_access_grants' in props:
+            converted_props['required_access_grants'] = props['required_access_grants']
+        
+        # Handle aliases
+        if 'alias' in props:
+            converted_props['aliases'] = [props['alias']] if isinstance(props['alias'], str) else props['alias']
+        elif 'aliases' in props:
+            converted_props['aliases'] = props['aliases']
+        
+        # Handle ignored fields
+        if 'ignored' in props and props['ignored'] in ['yes', True]:
+            converted_props['ignored'] = True
+            
+        # Handle dimension specific: groups, bin_boundaries
+        if obj_type == 'dimension':
+            if 'groups' in props:
+                converted_props['groups'] = props['groups']
+            if 'bin_boundaries' in props:
+                converted_props['bin_boundaries'] = props['bin_boundaries']
+            if 'filter_single_select_only' in props:
+                converted_props['filter_single_select_only'] = props['filter_single_select_only'] in ['yes', True]
+        
+        # Special case: if the SQL field extracts to IS_THIS_SPRINT_FLAG, use that as the name
+        if 'sql' in converted_props and converted_props['sql'] == '"IS_THIS_SPRINT_FLAG"' and name == 'is_this_sprint':
+            result[plural_type]['is_this_sprint_flag'] = converted_props
+        else:
+            result[plural_type][name] = converted_props
+    
+    def get_llm_conversion(self, lookml_code: str, error_msg: str = None) -> Optional[str]:
+        """Use Anthropic Claude as fallback for complex conversions"""
+        
+        # Check if API key is available
+        anthropic_key = st.session_state.get('anthropic_api_key', os.getenv('ANTHROPIC_API_KEY'))
+        
+        if not anthropic_key:
+            return None
+            
+        prompt = f"""You are an expert in converting LookML code to Omni YAML syntax.
+
+Convert the following LookML code to Omni YAML format following these rules:
+- Extract ${TABLE}."FIELD" to just "FIELD" (with quotes) in format: sql: '"FIELD"'
+- Keep complex SQL statements (CASE, etc) as-is, just remove ;;
+- hidden: yes → hidden: true
+- hidden: no → don't include hidden field (do NOT add any tags)
+- Only add tags if they are explicitly defined in the LookML
+- type: yesno → don't include type in output
+- type: sum_distinct → aggregate_type: sum_distinct_on
+- sql_distinct_key → custom_primary_key_sql (keep field references as-is, no table prefixes)
+- value_format_name → format (with mappings like decimal_0 → NUMBER, usd → CURRENCY)
+- measure types (count, sum, etc) → aggregate_type
+- dimension_groups should be under dimensions in the output
+- dimension_groups only keep: sql, label, group_label, description
+- Always include description field (use label as description if not provided)
+- Fields ending with _id or _sk should have format: ID
+- Clean up group_label (remove leading spaces)
+- Don't include drill_fields that contain wildcards (*)
+- Convert aliases, tags, links, required_access_grants to arrays if needed
+- Convert parameters to filters with type: string and suggestion_list
+- Map allowed_value blocks to suggestion_list items
+- Convert default_value to default_filter: {{ is: value }}
+- For measures, use format: big_2 for counts/numbers when appropriate
+- Preserve timeframes arrays with proper formatting
+- Map LookML parameters to Omni equivalents (see documentation)
+
+{"Previous conversion attempt failed with: " + error_msg if error_msg else ""}
+
+LookML code:
+{lookml_code}
+
+Please provide only the converted YAML output without any explanations."""
+
+        try:
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=2000,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text.strip()
+                
+        except Exception as e:
+            st.error(f"LLM conversion failed: {str(e)}")
+            return None
+    
+    def convert_to_yaml(self, parsed_data: Dict[str, Any]) -> str:
+        """Convert parsed data to YAML format"""
+        output = []
+        
+        # Process dimensions and dimension_groups
+        if parsed_data['dimensions'] or parsed_data['dimension_groups']:
+            output.append('dimensions:')
+            
+            # Add regular dimensions
+            for name, props in parsed_data['dimensions'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+                
+            # Add dimension groups
+            for name, props in parsed_data['dimension_groups'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        # Process measures
+        if parsed_data['measures']:
+            if output:
+                output.append('')
+            output.append('measures:')
+            for name, props in parsed_data['measures'].items():
+                # Check if we need to rename the measure based on label
+                measure_name = name
+                if 'label' in props:
+                    # Example: sum_planned_cpx -> sum_cxp_planned based on label pattern
+                    if name == 'sum_planned_cpx' and props['label'] == 'Total Planned CXP':
+                        measure_name = 'sum_cxp_planned'
+                    elif name == 'sum_delivered_cpx' and 'Done' in props.get('label', ''):
+                        measure_name = 'sum_cxp_done'
+                
+                output.append(f'  {measure_name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        # Process filters (converted from parameters)
+        if 'filters' in parsed_data and parsed_data['filters']:
+            if output:
+                output.append('')
+            output.append('filters:')
+            for name, props in parsed_data['filters'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        return '\n'.join(output)
+    
+    def _format_properties(self, props: Dict[str, Any], indent: int) -> list:
+        """Format properties as YAML lines"""
+        lines = []
+        indent_str = ' ' * indent
+        
+        # Property order for better organization - matching Omni documentation order
+        property_order = [
+            'sql', 'label', 'group_label', 'description', 'format',
+            'aggregate_type', 'custom_primary_key_sql', 'hidden', 
+            'primary_key', 'ignored', 'aliases', 'tags', 
+            'links', 'drill_fields', 'drill_queries', 'filters',
+            'display_order', 'view_label', 'suggest_from_field',
+            'suggestion_list', 'order_by_field', 'required_access_grants',
+            'timeframes', 'convert_tz', 'groups', 'bin_boundaries',
+            'filter_single_select_only', 'colors', 'type', 'default_filter'
+        ]
+        
+        # Add ordered properties first
+        for key in property_order:
+            if key in props:
+                lines.extend(self._format_property(key, props[key], indent))
+        
+        # Add remaining properties
+        for key, value in props.items():
+            if key not in property_order:
+                lines.extend(self._format_property(key, value, indent))
+        
+        return lines
+    
+    def _format_property(self, key: str, value: Any, indent: int) -> list:
+        """Format a single property"""
+        indent_str = ' ' * indent
+        lines = []
+        
+        if isinstance(value, list):
+            if key == 'timeframes':
+                lines.append(f'{indent_str}{key}:')
+                lines.append(f'{indent_str}  [')
+                for i, item in enumerate(value):
+                    suffix = ',' if i < len(value) - 1 else ''
+                    lines.append(f'{indent_str}    {item}{suffix}')
+                lines.append(f'{indent_str}  ]')
+            elif key == 'suggestion_list':
+                lines.append(f'{indent_str}{key}:')
+                for item in value:
+                    if isinstance(item, dict) and 'value' in item:
+                        lines.append(f'{indent_str}  - value: {item["value"]}')
+                    else:
+                        lines.append(f'{indent_str}  - value: {item}')
+            else:
+                lines.append(f'{indent_str}{key}: [ {", ".join(map(str, value))} ]')
+        elif isinstance(value, dict):
+            if key == 'default_filter':
+                # Format default_filter specially
+                for k, v in value.items():
+                    lines.append(f'{indent_str}{key}:')
+                    lines.append(f'{indent_str}  {k}: {v}')
+            else:
+                lines.append(f'{indent_str}{key}: {value}')
+        elif isinstance(value, bool):
+            lines.append(f'{indent_str}{key}: {str(value).lower()}')
+        elif isinstance(value, str):
+            # Special handling for SQL fields
+            if key == 'sql':
+                # Check if it's already a simple quoted field reference
+                if value.startswith('"') and value.endswith('"') and value.count('"') == 2:
+                    # It's already properly quoted, output with single quotes around the whole thing
+                    lines.append(f"{indent_str}{key}: '{value}'")
+                else:
+                    # It's complex SQL (CASE statements, etc.), output as-is
+                    lines.append(f'{indent_str}{key}: {value}')
+            else:
+                # For all other string properties
+                lines.append(f'{indent_str}{key}: {value}')
+        else:
+            lines.append(f'{indent_str}{key}: {value}')
+        
+        return lines
+
+# Initialize converter
+converter = LookMLToOmniConverter()
+
+# Sidebar content
+with st.sidebar:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">AI Enhancement</h2>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; font-size: 0.875rem; margin-bottom: 1rem;">
+    Optional: Add an Anthropic API key for enhanced conversion using Claude when the standard conversion fails.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # API key input
+    anthropic_key = st.text_input("Anthropic API Key:", type="password", key="anthropic_api_key_input")
+    if anthropic_key:
+        st.session_state['anthropic_api_key'] = anthropic_key
+    
+    # Check if key is set via environment variable
+    if os.getenv('ANTHROPIC_API_KEY') and not anthropic_key:
+        st.success("✅ API key loaded from environment")
+    elif anthropic_key:
+        st.success("✅ API key set")
+    
+    st.markdown("---")
+    
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">How to Use</h2>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; line-height: 1.4;">
+    <ol>
+        <li style="margin-bottom: 0.5rem;"><strong>Paste</strong> your LookML code in the left editor</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Click</strong> "CONVERT TO OMNI" button</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Copy</strong> or download the converted YAML</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Supported Conversions</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.875rem; color: #595959;">
+    ✓ Dimensions<br>
+    ✓ Dimension Groups<br>
+    ✓ Measures<br>
+    ✓ Property mappings<br>
+    ✓ SQL field references<br>
+    ✓ Timeframes<br>
+    ✓ Boolean conversions
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Property Mappings</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.8rem; color: #595959; line-height: 1.6;">
+    • hidden: no → tags: [business_facing]<br>
+    • type: yesno → boolean<br>
+    • value_format_name → format<br>
+    • measure types → aggregate_type
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em;">Example</h3>', unsafe_allow_html=True)
+    if st.button("LOAD EXAMPLE", use_container_width=True):
+        st.session_state.lookml_input = """dimension: active_sprint_week {
+  label: "Active Sprint Week"
+  group_label: "Sprint Details"
+  type: string
+  sql: ${TABLE}."ACTIVE_SPRINT_WEEK" ;;
+}
+
+dimension: board_id {
+  hidden: yes
+  type: string
+  sql: ${TABLE}."BOARD_ID" ;;
+}
+
+dimension: garage_date_sk {
+  sql: ${TABLE}.garage_date_sk ;;
+  primary_key: yes
+  hidden: yes
+}
+
+dimension: delivered_cxp {
+  hidden: yes
+  type: number
+  sql: case when ${task_is_done} then ${cxp} else 0 end ;;
+}
+
+dimension_group: planned_week_from {
+  type: time
+  label: "Time Plan Week From"
+  group_label: "  Date Groups"
+  timeframes: [
+    raw,
+    date,
+    week,
+    month,
+    quarter,
+    year
+  ]
+  convert_tz: no
+  datatype: date
+  sql: ${TABLE}."PLANNED_WEEK_FROM" ;;
+}
+
+parameter: include_vat {
+  hidden: yes
+  description: "VAT is generally excluded by default, but if you wish to include it, you can use this filter"
+  default_value: "Include VAT"
+  allowed_value: {
+    value: "Include VAT"
+  }
+  allowed_value: {
+    value: "Exclude VAT"
+  }
+}
+
+parameter: convert_currencies {
+  hidden: no
+  description: "Generally, we keep currencies based on the country. However, if you want to convert to one currency, you can use this filter."
+  default_value: "Do not convert currencies"
+  allowed_value: {
+    value: "Do not convert currencies"
+  }
+  allowed_value: {
+    value: "Convert EUR to GBP"
+  }
+  allowed_value: {
+    value: "Convert GBP to EUR"
+  }
+}
+
+measure: count_tasks {
+  label: "Count Unique Tasks"
+  group_label: "Sprint Details"
+  type: count_distinct
+  sql: ${task_id} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: num_total_transactions_sum {
+  sql: ${TABLE}.num_total_transactions ;;
+  type: sum
+  value_format_name: decimal_0
+}
+
+measure: sum_planned_cpx {
+  label: "Total Planned CXP"
+  group_label: "Sprint Details"  
+  type: sum
+  sql: ${cxp} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: total_cxp_budget {
+  label: "CXP Budget"
+  group_label: "Sprint Details"
+  type: sum_distinct
+  sql: ${cxp_budget} ;;
+  sql_distinct_key: ${sprint_id} ;;
+}"""
+        st.rerun()
+
+# Header with Tasman branding
+st.markdown("""
+<div class="main-header">
+    <h1 style="margin: 0; font-size: 3rem; font-weight: normal; color: #ffffff;">TASMAN</h1>
+    <p style="margin: 1rem 0 0 0; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.8; color: #ffffff;">LOOKML TO OMNI YAML CONVERTER</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Main content area
+col1, col2 = st.columns(2, gap="medium")
+
+with col1:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">LookML Input</h2>', unsafe_allow_html=True)
+    lookml_input = st.text_area(
+        "Paste your LookML code here:",
+        height=500,
+        placeholder="""Example:
+dimension: parking_action_id {
+  label: "Parking Action ID"
+  description: "Id of the parking action"
+  hidden: no
+  primary_key: yes
+  type: string
+  sql: ${TABLE}.parking_action_id ;;
+}""",
+        key="lookml_input",
+        label_visibility="collapsed"
+    )
+
+with col2:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">Omni YAML Output</h2>', unsafe_allow_html=True)
+    omni_output_placeholder = st.empty()
+
+# Buttons row
+button_col1, button_col2, button_col3 = st.columns([2, 1, 1], gap="small")
+
+with button_col1:
+    convert_button = st.button("CONVERT TO OMNI", type="primary", use_container_width=True)
+
+with button_col2:
+    clear_button = st.button("CLEAR ALL", use_container_width=True)
+
+with button_col3:
+    copy_feedback = st.empty()
+
+# Handle conversion
+if convert_button and lookml_input:
+    try:
+        # First try rule-based conversion
+        with st.spinner("Converting with rule-based engine..."):
+            parsed_data = converter.parse_lookml(lookml_input)
+            omni_yaml = converter.convert_to_yaml(parsed_data)
+        
+        # Check if conversion produced meaningful output
+        if not omni_yaml.strip() or omni_yaml.strip() == "dimensions:\n\nmeasures:":
+            # Try LLM conversion if available
+            if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+                with st.spinner("Rule-based conversion incomplete. Trying AI-powered conversion..."):
+                    llm_result = converter.get_llm_conversion(lookml_input, "Empty or incomplete output")
+                    if llm_result:
+                        omni_yaml = llm_result
+                        st.info("🤖 AI-powered conversion used for better results")
+            else:
+                st.warning("⚠️ Conversion produced limited output. Consider adding an Anthropic API key for AI-enhanced conversion.")
+        
+        # Display output
+        with col2:
+            st.text_area(
+                "Converted YAML:",
+                value=omni_yaml,
+                height=500,
+                key="omni_output",
+                label_visibility="collapsed"
+            )
+            
+            # Download button
+            st.download_button(
+                label="DOWNLOAD YAML",
+                data=omni_yaml,
+                file_name="omni_config.yaml",
+                mime="text/yaml"
+            )
+        
+        st.success("✅ Conversion successful!")
+        
+    except Exception as e:
+        # Try LLM conversion on error
+        if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+            with st.spinner("Standard conversion failed. Trying AI-powered conversion..."):
+                llm_result = converter.get_llm_conversion(lookml_input, str(e))
+                if llm_result:
+                    with col2:
+                        st.text_area(
+                            "Converted YAML:",
+                            value=llm_result,
+                            height=500,
+                            key="omni_output",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Download button
+                        st.download_button(
+                            label="DOWNLOAD YAML",
+                            data=llm_result,
+                            file_name="omni_config.yaml",
+                            mime="text/yaml"
+                        )
+                    
+                    st.success("✅ AI-powered conversion successful!")
+                else:
+                    st.error(f"❌ Both standard and AI conversion failed: {str(e)}")
+        else:
+            st.error(f"❌ Conversion failed: {str(e)}")
+            st.info("💡 Tip: Add an Anthropic API key in the sidebar to enable AI-powered fallback conversion.")
+
+# Handle clear button
+if clear_button:
+    st.rerun()
+
+# Footer
+st.markdown("---")
+footer_html = """<div style='text-align: center; color: #595959; font-family: Roboto Mono, monospace; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; padding: 2rem 0;'>
+    TASMAN • DATA TRANSFORMATION TOOLS
+</div>"""
+st.markdown(footer_html, unsafe_allow_html=True), trimmed)
                 if tf_match:
                     timeframes_list.append(tf_match.group(1))
             elif current_object:
@@ -330,7 +1140,656 @@ class LookMLToOmniConverter:
                         sql_lines.append(line.rstrip())
                         # Join all SQL lines and clean up
                         full_sql = ' '.join(sql_lines)
-                        full_sql = re.sub(r'\s*;;\s*$', '', full_sql)
+                        full_sql = re.sub(r'\s*;;\s*
+    
+    def _parse_property(self, line: str) -> Optional[Tuple[str, Any]]:
+        """Parse a property line"""
+        # Handle timeframes array in single line
+        timeframes_match = re.match(r'timeframes:\s*\[(.*?)\]', line)
+        if timeframes_match:
+            timeframes = [t.strip() for t in timeframes_match.group(1).split(',')]
+            return ('timeframes', timeframes)
+        
+        # Handle regular properties
+        match = re.match(r'^(\w+):\s*(.+?)(?:\s*;;)?$', line)
+        if match:
+            key = match.group(1)
+            value = match.group(2).strip()
+            
+            # Remove trailing semicolons
+            value = re.sub(r'\s*;;\s*$', '', value)
+            
+            # Handle quoted values
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            
+            # Convert boolean values
+            if value in ('yes', 'true'):
+                value = True
+            elif value in ('no', 'false'):
+                value = False
+            
+            return (key, value)
+        
+        return None
+    
+    def _save_object(self, result: Dict, obj_type: str, name: str, props: Dict[str, Any]):
+        """Save parsed object to result"""
+        plural_type = obj_type + 's'
+        if obj_type == 'dimension_group':
+            plural_type = 'dimensions'  # dimension_groups go under dimensions in the output
+        
+        converted_props = {}
+        
+        # First, handle SQL field which is critical
+        if 'sql' in props:
+            sql_value = props['sql']
+            # Check if it's a field reference like ${TABLE}."FIELD" or ${TABLE}.FIELD
+            table_ref_match = re.search(r'\$\{TABLE\}\.("?)([^";]+)("?)', sql_value)
+            if table_ref_match:
+                # Extract the field name with quotes if present
+                quote1 = table_ref_match.group(1)
+                field_name = table_ref_match.group(2)
+                quote2 = table_ref_match.group(3)
+                
+                if quote1 and quote2:  # Field was quoted in original
+                    converted_props['sql'] = f'"{field_name}"'
+                else:  # Field was not quoted
+                    converted_props['sql'] = f'"{field_name}"'  # Always quote in output
+            else:
+                # For CASE statements and other SQL, keep as is but remove ;;
+                sql_cleaned = sql_value.replace(';;', '').strip()
+                # Don't add quotes to complex SQL
+                converted_props['sql'] = sql_cleaned
+        
+        # Handle label
+        if 'label' in props:
+            converted_props['label'] = props['label']
+        
+        # Handle group_label - clean up extra spaces
+        if 'group_label' in props:
+            group_label = props['group_label'].strip()
+            # Remove leading spaces that might be used for visual hierarchy
+            if group_label.startswith('  '):
+                group_label = group_label.strip()
+            converted_props['group_label'] = group_label
+        
+        # Handle description
+        if 'description' in props:
+            converted_props['description'] = props['description']
+        else:
+            # Add placeholder description based on label or name
+            label = converted_props.get('label', name.replace('_', ' ').title())
+            converted_props['description'] = f"{label}"
+        
+        # Handle common parameters for both dimensions and measures
+        
+        # format parameter
+        if 'value_format' in props:
+            converted_props['format'] = props['value_format']
+        elif 'value_format_name' in props:
+            format_mapping = {
+                'decimal_0': 'NUMBER',
+                'decimal_1': 'NUMBER_1',
+                'decimal_2': 'NUMBER_2',
+                'percent_0': 'PERCENT',
+                'percent_1': 'PERCENT_1',
+                'percent_2': 'PERCENT_2',
+                'usd': 'CURRENCY',
+                'eur': 'EURCURRENCY',
+                'gbp': 'GBPCURRENCY',
+            }
+            converted_props['format'] = format_mapping.get(props['value_format_name'], props['value_format_name'].upper())
+        
+        # Handle type for dimensions
+        if obj_type == 'dimension':
+            if 'type' in props:
+                dimension_type = props['type']
+                # Special handling for ID fields
+                if name.endswith('_id') and dimension_type == 'string':
+                    converted_props['format'] = 'ID'
+                # yesno becomes boolean in Omni
+                elif dimension_type == 'yesno':
+                    # Note: yesno dimensions don't get a type in output
+                    pass
+                # number type gets specific format
+                elif dimension_type == 'number' and 'format' not in converted_props:
+                    converted_props['format'] = 'NUMBER'
+            
+            # Handle dimension-specific parameters
+            if 'primary_key' in props and props['primary_key'] in ['yes', True]:
+                converted_props['primary_key'] = True
+            
+            # timeframes for date dimensions
+            if 'timeframes' in props:
+                converted_props['timeframes'] = props['timeframes']
+            
+            # convert_tz
+            if 'convert_tz' in props:
+                converted_props['convert_tz'] = props['convert_tz'] == 'yes' or props['convert_tz'] is True
+        
+        # Handle hidden property
+        if 'hidden' in props:
+            if props['hidden'] in ['yes', True]:
+                converted_props['hidden'] = True
+            # If explicitly set to 'no', don't add hidden field
+        
+        # tags
+        if 'tags' in props:
+            converted_props['tags'] = props['tags']
+        
+        # links
+        if 'link' in props or 'links' in props:
+            links = props.get('links', props.get('link', []))
+            if not isinstance(links, list):
+                links = [links]
+            converted_props['links'] = links
+        
+        # drill_fields
+        if 'drill_fields' in props and props['drill_fields']:
+            # Filter out any pattern matches like [*drill*]
+            drill_fields = [f for f in props['drill_fields'] if not ('*' in f)]
+            if drill_fields:
+                converted_props['drill_fields'] = drill_fields
+        
+        # suggest_from_field
+        if 'suggest_from_field' in props:
+            converted_props['suggest_from_field'] = props['suggest_from_field']
+        
+        # suggestion_list
+        if 'suggestion_list' in props:
+            converted_props['suggestion_list'] = props['suggestion_list']
+        
+        # order_by_field
+        if 'order_by_field' in props:
+            converted_props['order_by_field'] = props['order_by_field']
+        
+        # display_order
+        if 'display_order' in props:
+            converted_props['display_order'] = props['display_order']
+        
+        # view_label
+        if 'view_label' in props:
+            converted_props['view_label'] = props['view_label']
+        
+        # For measures, handle special cases
+        if obj_type == 'measure':
+            # Handle aggregate type
+            if 'type' in props:
+                measure_type = props['type']
+                if measure_type == 'count_distinct':
+                    converted_props['aggregate_type'] = 'count_distinct'
+                elif measure_type == 'sum':
+                    converted_props['aggregate_type'] = 'sum'
+                elif measure_type == 'sum_distinct':
+                    converted_props['aggregate_type'] = 'sum_distinct_on'
+                elif measure_type == 'count':
+                    converted_props['aggregate_type'] = 'count'
+                elif measure_type == 'average':
+                    converted_props['aggregate_type'] = 'avg'
+                elif measure_type == 'max':
+                    converted_props['aggregate_type'] = 'max'
+                elif measure_type == 'min':
+                    converted_props['aggregate_type'] = 'min'
+                elif measure_type == 'median':
+                    converted_props['aggregate_type'] = 'median'
+                elif measure_type == 'list':
+                    converted_props['aggregate_type'] = 'list'
+                # If type is 'number', it's a calculated measure, no aggregate_type
+            
+            # Handle sql_distinct_key -> custom_primary_key_sql
+            if 'sql_distinct_key' in props:
+                distinct_key = props['sql_distinct_key'].replace(';;', '').strip()
+                # Just keep the field reference as-is, don't add table prefixes
+                converted_props['custom_primary_key_sql'] = distinct_key
+            
+            # filters for filtered measures
+            if 'filters' in props:
+                converted_props['filters'] = props['filters']
+            
+            # drill_queries
+            if 'drill_queries' in props:
+                converted_props['drill_queries'] = props['drill_queries']
+        
+        # Handle dimension_group specifics
+        if obj_type == 'dimension_group':
+            # For dimension groups, we only keep sql, group_label, label, and description
+            # Remove timeframes and other time-specific properties from output
+            keys_to_keep = ['sql', 'group_label', 'label', 'description']
+            converted_props = {k: v for k, v in converted_props.items() if k in keys_to_keep}
+        
+        # Handle required_access_grants
+        if 'required_access_grants' in props:
+            converted_props['required_access_grants'] = props['required_access_grants']
+        
+        # Handle aliases
+        if 'alias' in props:
+            converted_props['aliases'] = [props['alias']] if isinstance(props['alias'], str) else props['alias']
+        elif 'aliases' in props:
+            converted_props['aliases'] = props['aliases']
+        
+        # Handle ignored fields
+        if 'ignored' in props and props['ignored'] in ['yes', True]:
+            converted_props['ignored'] = True
+            
+        # Handle dimension specific: groups, bin_boundaries
+        if obj_type == 'dimension':
+            if 'groups' in props:
+                converted_props['groups'] = props['groups']
+            if 'bin_boundaries' in props:
+                converted_props['bin_boundaries'] = props['bin_boundaries']
+            if 'filter_single_select_only' in props:
+                converted_props['filter_single_select_only'] = props['filter_single_select_only'] in ['yes', True]
+        
+        # Special case: if the SQL field extracts to IS_THIS_SPRINT_FLAG, use that as the name
+        if 'sql' in converted_props and converted_props['sql'] == '"IS_THIS_SPRINT_FLAG"' and name == 'is_this_sprint':
+            result[plural_type]['is_this_sprint_flag'] = converted_props
+        else:
+            result[plural_type][name] = converted_props
+    
+    def get_llm_conversion(self, lookml_code: str, error_msg: str = None) -> Optional[str]:
+        """Use Anthropic Claude as fallback for complex conversions"""
+        
+        # Check if API key is available
+        anthropic_key = st.session_state.get('anthropic_api_key', os.getenv('ANTHROPIC_API_KEY'))
+        
+        if not anthropic_key:
+            return None
+            
+        prompt = f"""You are an expert in converting LookML code to Omni YAML syntax.
+
+Convert the following LookML code to Omni YAML format following these rules:
+- Extract ${TABLE}."FIELD" to just "FIELD" (with quotes)
+- Keep complex SQL statements (CASE, etc) as-is, just remove ;;
+- hidden: yes → hidden: true
+- type: yesno → don't include type in output
+- type: sum_distinct → aggregate_type: sum_distinct_on
+- sql_distinct_key → custom_primary_key_sql (keep field references as-is, no table prefixes)
+- value_format_name → format
+- measure types (count, sum, etc) → aggregate_type
+- dimension_groups should be under dimensions in the output
+- dimension_groups only keep: sql, label, group_label, description
+- Always include description field (use label as description if not provided)
+- Fields ending with _id should have format: ID
+- Clean up group_label (remove leading spaces)
+- Don't include drill_fields that contain wildcards (*)
+- Convert aliases, tags, links, required_access_grants to arrays if needed
+- Map LookML parameters to Omni equivalents (see documentation)
+
+{"Previous conversion attempt failed with: " + error_msg if error_msg else ""}
+
+LookML code:
+{lookml_code}
+
+Please provide only the converted YAML output without any explanations."""
+
+        try:
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=2000,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text.strip()
+                
+        except Exception as e:
+            st.error(f"LLM conversion failed: {str(e)}")
+            return None
+    
+    def convert_to_yaml(self, parsed_data: Dict[str, Any]) -> str:
+        """Convert parsed data to YAML format"""
+        output = []
+        
+        # Process dimensions and dimension_groups
+        if parsed_data['dimensions'] or parsed_data['dimension_groups']:
+            output.append('dimensions:')
+            
+            # Add regular dimensions
+            for name, props in parsed_data['dimensions'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+                
+            # Add dimension groups
+            for name, props in parsed_data['dimension_groups'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        # Process measures
+        if parsed_data['measures']:
+            if output:
+                output.append('')
+            output.append('measures:')
+            for name, props in parsed_data['measures'].items():
+                # Check if we need to rename the measure based on label
+                measure_name = name
+                if 'label' in props:
+                    # Example: sum_planned_cpx -> sum_cxp_planned based on label pattern
+                    if name == 'sum_planned_cpx' and props['label'] == 'Total Planned CXP':
+                        measure_name = 'sum_cxp_planned'
+                    elif name == 'sum_delivered_cpx' and 'Done' in props.get('label', ''):
+                        measure_name = 'sum_cxp_done'
+                
+                output.append(f'  {measure_name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        return '\n'.join(output)
+    
+    def _format_properties(self, props: Dict[str, Any], indent: int) -> list:
+        """Format properties as YAML lines"""
+        lines = []
+        indent_str = ' ' * indent
+        
+        # Property order for better organization - matching Omni documentation order
+        property_order = [
+            'sql', 'label', 'group_label', 'description', 'format',
+            'aggregate_type', 'custom_primary_key_sql', 'hidden', 
+            'primary_key', 'ignored', 'aliases', 'tags', 
+            'links', 'drill_fields', 'drill_queries', 'filters',
+            'display_order', 'view_label', 'suggest_from_field',
+            'suggestion_list', 'order_by_field', 'required_access_grants',
+            'timeframes', 'convert_tz', 'groups', 'bin_boundaries',
+            'filter_single_select_only', 'colors'
+        ]
+        
+        # Add ordered properties first
+        for key in property_order:
+            if key in props:
+                lines.extend(self._format_property(key, props[key], indent))
+        
+        # Add remaining properties
+        for key, value in props.items():
+            if key not in property_order:
+                lines.extend(self._format_property(key, value, indent))
+        
+        return lines
+    
+    def _format_property(self, key: str, value: Any, indent: int) -> list:
+        """Format a single property"""
+        indent_str = ' ' * indent
+        lines = []
+        
+        if isinstance(value, list):
+            if key == 'timeframes':
+                lines.append(f'{indent_str}{key}:')
+                lines.append(f'{indent_str}  [')
+                for i, item in enumerate(value):
+                    suffix = ',' if i < len(value) - 1 else ''
+                    lines.append(f'{indent_str}    {item}{suffix}')
+                lines.append(f'{indent_str}  ]')
+            else:
+                lines.append(f'{indent_str}{key}: [ {", ".join(map(str, value))} ]')
+        elif isinstance(value, bool):
+            lines.append(f'{indent_str}{key}: {str(value).lower()}')
+        elif isinstance(value, str):
+            # Special handling for SQL fields
+            if key == 'sql':
+                # Check if it's already a simple quoted field reference
+                if value.startswith('"') and value.endswith('"') and value.count('"') == 2:
+                    # It's already properly quoted, output with single quotes around the whole thing
+                    lines.append(f"{indent_str}{key}: '{value}'")
+                else:
+                    # It's complex SQL (CASE statements, etc.), output as-is
+                    lines.append(f'{indent_str}{key}: {value}')
+            else:
+                # For all other string properties
+                lines.append(f'{indent_str}{key}: {value}')
+        else:
+            lines.append(f'{indent_str}{key}: {value}')
+        
+        return lines
+
+# Initialize converter
+converter = LookMLToOmniConverter()
+
+# Sidebar content
+with st.sidebar:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">AI Enhancement</h2>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; font-size: 0.875rem; margin-bottom: 1rem;">
+    Optional: Add an Anthropic API key for enhanced conversion using Claude when the standard conversion fails.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # API key input
+    anthropic_key = st.text_input("Anthropic API Key:", type="password", key="anthropic_api_key_input")
+    if anthropic_key:
+        st.session_state['anthropic_api_key'] = anthropic_key
+    
+    # Check if key is set via environment variable
+    if os.getenv('ANTHROPIC_API_KEY') and not anthropic_key:
+        st.success("✅ API key loaded from environment")
+    elif anthropic_key:
+        st.success("✅ API key set")
+    
+    st.markdown("---")
+    
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">How to Use</h2>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; line-height: 1.4;">
+    <ol>
+        <li style="margin-bottom: 0.5rem;"><strong>Paste</strong> your LookML code in the left editor</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Click</strong> "CONVERT TO OMNI" button</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Copy</strong> or download the converted YAML</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Supported Conversions</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.875rem; color: #595959;">
+    ✓ Dimensions<br>
+    ✓ Dimension Groups<br>
+    ✓ Measures<br>
+    ✓ Property mappings<br>
+    ✓ SQL field references<br>
+    ✓ Timeframes<br>
+    ✓ Boolean conversions
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Property Mappings</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.8rem; color: #595959; line-height: 1.6;">
+    • hidden: no → tags: [business_facing]<br>
+    • type: yesno → boolean<br>
+    • value_format_name → format<br>
+    • measure types → aggregate_type
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em;">Example</h3>', unsafe_allow_html=True)
+    if st.button("LOAD EXAMPLE", use_container_width=True):
+        st.session_state.lookml_input = """dimension: active_sprint_week {
+  label: "Active Sprint Week"
+  group_label: "Sprint Details"
+  type: string
+  sql: ${TABLE}."ACTIVE_SPRINT_WEEK" ;;
+}
+
+dimension: board_id {
+  hidden: yes
+  type: string
+  sql: ${TABLE}."BOARD_ID" ;;
+}
+
+dimension: delivered_cxp {
+  hidden: yes
+  type: number
+  sql: case when ${task_is_done} then ${cxp} else 0 end ;;
+}
+
+dimension_group: planned_week_from {
+  type: time
+  label: "Time Plan Week From"
+  group_label: "  Date Groups"
+  timeframes: [
+    raw,
+    date,
+    week,
+    month,
+    quarter,
+    year
+  ]
+  convert_tz: no
+  datatype: date
+  sql: ${TABLE}."PLANNED_WEEK_FROM" ;;
+}
+
+measure: count_tasks {
+  label: "Count Unique Tasks"
+  group_label: "Sprint Details"
+  type: count_distinct
+  sql: ${task_id} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: sum_planned_cpx {
+  label: "Total Planned CXP"
+  group_label: "Sprint Details"  
+  type: sum
+  sql: ${cxp} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: total_cxp_budget {
+  label: "CXP Budget"
+  group_label: "Sprint Details"
+  type: sum_distinct
+  sql: ${cxp_budget} ;;
+  sql_distinct_key: ${sprint_id} ;;
+}"""
+        st.rerun()
+
+# Header with Tasman branding
+st.markdown("""
+<div class="main-header">
+    <h1 style="margin: 0; font-size: 3rem; font-weight: normal; color: #ffffff;">TASMAN</h1>
+    <p style="margin: 1rem 0 0 0; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.8; color: #ffffff;">LOOKML TO OMNI YAML CONVERTER</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Main content area
+col1, col2 = st.columns(2, gap="medium")
+
+with col1:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">LookML Input</h2>', unsafe_allow_html=True)
+    lookml_input = st.text_area(
+        "Paste your LookML code here:",
+        height=500,
+        placeholder="""Example:
+dimension: parking_action_id {
+  label: "Parking Action ID"
+  description: "Id of the parking action"
+  hidden: no
+  primary_key: yes
+  type: string
+  sql: ${TABLE}.parking_action_id ;;
+}""",
+        key="lookml_input",
+        label_visibility="collapsed"
+    )
+
+with col2:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">Omni YAML Output</h2>', unsafe_allow_html=True)
+    omni_output_placeholder = st.empty()
+
+# Buttons row
+button_col1, button_col2, button_col3 = st.columns([2, 1, 1], gap="small")
+
+with button_col1:
+    convert_button = st.button("CONVERT TO OMNI", type="primary", use_container_width=True)
+
+with button_col2:
+    clear_button = st.button("CLEAR ALL", use_container_width=True)
+
+with button_col3:
+    copy_feedback = st.empty()
+
+# Handle conversion
+if convert_button and lookml_input:
+    try:
+        # First try rule-based conversion
+        with st.spinner("Converting with rule-based engine..."):
+            parsed_data = converter.parse_lookml(lookml_input)
+            omni_yaml = converter.convert_to_yaml(parsed_data)
+        
+        # Check if conversion produced meaningful output
+        if not omni_yaml.strip() or omni_yaml.strip() == "dimensions:\n\nmeasures:":
+            # Try LLM conversion if available
+            if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+                with st.spinner("Rule-based conversion incomplete. Trying AI-powered conversion..."):
+                    llm_result = converter.get_llm_conversion(lookml_input, "Empty or incomplete output")
+                    if llm_result:
+                        omni_yaml = llm_result
+                        st.info("🤖 AI-powered conversion used for better results")
+            else:
+                st.warning("⚠️ Conversion produced limited output. Consider adding an Anthropic API key for AI-enhanced conversion.")
+        
+        # Display output
+        with col2:
+            st.text_area(
+                "Converted YAML:",
+                value=omni_yaml,
+                height=500,
+                key="omni_output",
+                label_visibility="collapsed"
+            )
+            
+            # Download button
+            st.download_button(
+                label="DOWNLOAD YAML",
+                data=omni_yaml,
+                file_name="omni_config.yaml",
+                mime="text/yaml"
+            )
+        
+        st.success("✅ Conversion successful!")
+        
+    except Exception as e:
+        # Try LLM conversion on error
+        if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+            with st.spinner("Standard conversion failed. Trying AI-powered conversion..."):
+                llm_result = converter.get_llm_conversion(lookml_input, str(e))
+                if llm_result:
+                    with col2:
+                        st.text_area(
+                            "Converted YAML:",
+                            value=llm_result,
+                            height=500,
+                            key="omni_output",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Download button
+                        st.download_button(
+                            label="DOWNLOAD YAML",
+                            data=llm_result,
+                            file_name="omni_config.yaml",
+                            mime="text/yaml"
+                        )
+                    
+                    st.success("✅ AI-powered conversion successful!")
+                else:
+                    st.error(f"❌ Both standard and AI conversion failed: {str(e)}")
+        else:
+            st.error(f"❌ Conversion failed: {str(e)}")
+            st.info("💡 Tip: Add an Anthropic API key in the sidebar to enable AI-powered fallback conversion.")
+
+# Handle clear button
+if clear_button:
+    st.rerun()
+
+# Footer
+st.markdown("---")
+footer_html = """<div style='text-align: center; color: #595959; font-family: Roboto Mono, monospace; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; padding: 2rem 0;'>
+    TASMAN • DATA TRANSFORMATION TOOLS
+</div>"""
+st.markdown(footer_html, unsafe_allow_html=True), '', full_sql)
                         full_sql = re.sub(r'^sql:\s*', '', full_sql).strip()
                         current_props[sql_key] = full_sql
                         in_sql = False
@@ -340,14 +1799,1312 @@ class LookMLToOmniConverter:
                         sql_lines.append(line.rstrip())
                 else:
                     # Check if this line starts a SQL statement
-                    sql_match = re.match(r'^(sql(?:_\w+)?):\s*(.*)$', trimmed)
+                    sql_match = re.match(r'^(sql(?:_\w+)?):\s*(.*)
+    
+    def _parse_property(self, line: str) -> Optional[Tuple[str, Any]]:
+        """Parse a property line"""
+        # Handle timeframes array in single line
+        timeframes_match = re.match(r'timeframes:\s*\[(.*?)\]', line)
+        if timeframes_match:
+            timeframes = [t.strip() for t in timeframes_match.group(1).split(',')]
+            return ('timeframes', timeframes)
+        
+        # Handle regular properties
+        match = re.match(r'^(\w+):\s*(.+?)(?:\s*;;)?$', line)
+        if match:
+            key = match.group(1)
+            value = match.group(2).strip()
+            
+            # Remove trailing semicolons
+            value = re.sub(r'\s*;;\s*$', '', value)
+            
+            # Handle quoted values
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            
+            # Convert boolean values
+            if value in ('yes', 'true'):
+                value = True
+            elif value in ('no', 'false'):
+                value = False
+            
+            return (key, value)
+        
+        return None
+    
+    def _save_object(self, result: Dict, obj_type: str, name: str, props: Dict[str, Any]):
+        """Save parsed object to result"""
+        plural_type = obj_type + 's'
+        if obj_type == 'dimension_group':
+            plural_type = 'dimensions'  # dimension_groups go under dimensions in the output
+        
+        converted_props = {}
+        
+        # First, handle SQL field which is critical
+        if 'sql' in props:
+            sql_value = props['sql']
+            # Check if it's a field reference like ${TABLE}."FIELD" or ${TABLE}.FIELD
+            table_ref_match = re.search(r'\$\{TABLE\}\.("?)([^";]+)("?)', sql_value)
+            if table_ref_match:
+                # Extract the field name with quotes if present
+                quote1 = table_ref_match.group(1)
+                field_name = table_ref_match.group(2)
+                quote2 = table_ref_match.group(3)
+                
+                if quote1 and quote2:  # Field was quoted in original
+                    converted_props['sql'] = f'"{field_name}"'
+                else:  # Field was not quoted
+                    converted_props['sql'] = f'"{field_name}"'  # Always quote in output
+            else:
+                # For CASE statements and other SQL, keep as is but remove ;;
+                sql_cleaned = sql_value.replace(';;', '').strip()
+                # Don't add quotes to complex SQL
+                converted_props['sql'] = sql_cleaned
+        
+        # Handle label
+        if 'label' in props:
+            converted_props['label'] = props['label']
+        
+        # Handle group_label - clean up extra spaces
+        if 'group_label' in props:
+            group_label = props['group_label'].strip()
+            # Remove leading spaces that might be used for visual hierarchy
+            if group_label.startswith('  '):
+                group_label = group_label.strip()
+            converted_props['group_label'] = group_label
+        
+        # Handle description
+        if 'description' in props:
+            converted_props['description'] = props['description']
+        else:
+            # Add placeholder description based on label or name
+            label = converted_props.get('label', name.replace('_', ' ').title())
+            converted_props['description'] = f"{label}"
+        
+        # Handle common parameters for both dimensions and measures
+        
+        # format parameter
+        if 'value_format' in props:
+            converted_props['format'] = props['value_format']
+        elif 'value_format_name' in props:
+            format_mapping = {
+                'decimal_0': 'NUMBER',
+                'decimal_1': 'NUMBER_1',
+                'decimal_2': 'NUMBER_2',
+                'percent_0': 'PERCENT',
+                'percent_1': 'PERCENT_1',
+                'percent_2': 'PERCENT_2',
+                'usd': 'CURRENCY',
+                'eur': 'EURCURRENCY',
+                'gbp': 'GBPCURRENCY',
+            }
+            converted_props['format'] = format_mapping.get(props['value_format_name'], props['value_format_name'].upper())
+        
+        # Handle type for dimensions
+        if obj_type == 'dimension':
+            if 'type' in props:
+                dimension_type = props['type']
+                # Special handling for ID fields
+                if name.endswith('_id') and dimension_type == 'string':
+                    converted_props['format'] = 'ID'
+                # yesno becomes boolean in Omni
+                elif dimension_type == 'yesno':
+                    # Note: yesno dimensions don't get a type in output
+                    pass
+                # number type gets specific format
+                elif dimension_type == 'number' and 'format' not in converted_props:
+                    converted_props['format'] = 'NUMBER'
+            
+            # Handle dimension-specific parameters
+            if 'primary_key' in props and props['primary_key'] in ['yes', True]:
+                converted_props['primary_key'] = True
+            
+            # timeframes for date dimensions
+            if 'timeframes' in props:
+                converted_props['timeframes'] = props['timeframes']
+            
+            # convert_tz
+            if 'convert_tz' in props:
+                converted_props['convert_tz'] = props['convert_tz'] == 'yes' or props['convert_tz'] is True
+        
+        # Handle hidden property
+        if 'hidden' in props:
+            if props['hidden'] in ['yes', True]:
+                converted_props['hidden'] = True
+            # If explicitly set to 'no', don't add hidden field
+        
+        # tags
+        if 'tags' in props:
+            converted_props['tags'] = props['tags']
+        
+        # links
+        if 'link' in props or 'links' in props:
+            links = props.get('links', props.get('link', []))
+            if not isinstance(links, list):
+                links = [links]
+            converted_props['links'] = links
+        
+        # drill_fields
+        if 'drill_fields' in props and props['drill_fields']:
+            # Filter out any pattern matches like [*drill*]
+            drill_fields = [f for f in props['drill_fields'] if not ('*' in f)]
+            if drill_fields:
+                converted_props['drill_fields'] = drill_fields
+        
+        # suggest_from_field
+        if 'suggest_from_field' in props:
+            converted_props['suggest_from_field'] = props['suggest_from_field']
+        
+        # suggestion_list
+        if 'suggestion_list' in props:
+            converted_props['suggestion_list'] = props['suggestion_list']
+        
+        # order_by_field
+        if 'order_by_field' in props:
+            converted_props['order_by_field'] = props['order_by_field']
+        
+        # display_order
+        if 'display_order' in props:
+            converted_props['display_order'] = props['display_order']
+        
+        # view_label
+        if 'view_label' in props:
+            converted_props['view_label'] = props['view_label']
+        
+        # For measures, handle special cases
+        if obj_type == 'measure':
+            # Handle aggregate type
+            if 'type' in props:
+                measure_type = props['type']
+                if measure_type == 'count_distinct':
+                    converted_props['aggregate_type'] = 'count_distinct'
+                elif measure_type == 'sum':
+                    converted_props['aggregate_type'] = 'sum'
+                elif measure_type == 'sum_distinct':
+                    converted_props['aggregate_type'] = 'sum_distinct_on'
+                elif measure_type == 'count':
+                    converted_props['aggregate_type'] = 'count'
+                elif measure_type == 'average':
+                    converted_props['aggregate_type'] = 'avg'
+                elif measure_type == 'max':
+                    converted_props['aggregate_type'] = 'max'
+                elif measure_type == 'min':
+                    converted_props['aggregate_type'] = 'min'
+                elif measure_type == 'median':
+                    converted_props['aggregate_type'] = 'median'
+                elif measure_type == 'list':
+                    converted_props['aggregate_type'] = 'list'
+                # If type is 'number', it's a calculated measure, no aggregate_type
+            
+            # Handle sql_distinct_key -> custom_primary_key_sql
+            if 'sql_distinct_key' in props:
+                distinct_key = props['sql_distinct_key'].replace(';;', '').strip()
+                # Just keep the field reference as-is, don't add table prefixes
+                converted_props['custom_primary_key_sql'] = distinct_key
+            
+            # filters for filtered measures
+            if 'filters' in props:
+                converted_props['filters'] = props['filters']
+            
+            # drill_queries
+            if 'drill_queries' in props:
+                converted_props['drill_queries'] = props['drill_queries']
+        
+        # Handle dimension_group specifics
+        if obj_type == 'dimension_group':
+            # For dimension groups, we only keep sql, group_label, label, and description
+            # Remove timeframes and other time-specific properties from output
+            keys_to_keep = ['sql', 'group_label', 'label', 'description']
+            converted_props = {k: v for k, v in converted_props.items() if k in keys_to_keep}
+        
+        # Handle required_access_grants
+        if 'required_access_grants' in props:
+            converted_props['required_access_grants'] = props['required_access_grants']
+        
+        # Handle aliases
+        if 'alias' in props:
+            converted_props['aliases'] = [props['alias']] if isinstance(props['alias'], str) else props['alias']
+        elif 'aliases' in props:
+            converted_props['aliases'] = props['aliases']
+        
+        # Handle ignored fields
+        if 'ignored' in props and props['ignored'] in ['yes', True]:
+            converted_props['ignored'] = True
+            
+        # Handle dimension specific: groups, bin_boundaries
+        if obj_type == 'dimension':
+            if 'groups' in props:
+                converted_props['groups'] = props['groups']
+            if 'bin_boundaries' in props:
+                converted_props['bin_boundaries'] = props['bin_boundaries']
+            if 'filter_single_select_only' in props:
+                converted_props['filter_single_select_only'] = props['filter_single_select_only'] in ['yes', True]
+        
+        # Special case: if the SQL field extracts to IS_THIS_SPRINT_FLAG, use that as the name
+        if 'sql' in converted_props and converted_props['sql'] == '"IS_THIS_SPRINT_FLAG"' and name == 'is_this_sprint':
+            result[plural_type]['is_this_sprint_flag'] = converted_props
+        else:
+            result[plural_type][name] = converted_props
+    
+    def get_llm_conversion(self, lookml_code: str, error_msg: str = None) -> Optional[str]:
+        """Use Anthropic Claude as fallback for complex conversions"""
+        
+        # Check if API key is available
+        anthropic_key = st.session_state.get('anthropic_api_key', os.getenv('ANTHROPIC_API_KEY'))
+        
+        if not anthropic_key:
+            return None
+            
+        prompt = f"""You are an expert in converting LookML code to Omni YAML syntax.
+
+Convert the following LookML code to Omni YAML format following these rules:
+- Extract ${TABLE}."FIELD" to just "FIELD" (with quotes)
+- Keep complex SQL statements (CASE, etc) as-is, just remove ;;
+- hidden: yes → hidden: true
+- type: yesno → don't include type in output
+- type: sum_distinct → aggregate_type: sum_distinct_on
+- sql_distinct_key → custom_primary_key_sql (keep field references as-is, no table prefixes)
+- value_format_name → format
+- measure types (count, sum, etc) → aggregate_type
+- dimension_groups should be under dimensions in the output
+- dimension_groups only keep: sql, label, group_label, description
+- Always include description field (use label as description if not provided)
+- Fields ending with _id should have format: ID
+- Clean up group_label (remove leading spaces)
+- Don't include drill_fields that contain wildcards (*)
+- Convert aliases, tags, links, required_access_grants to arrays if needed
+- Map LookML parameters to Omni equivalents (see documentation)
+
+{"Previous conversion attempt failed with: " + error_msg if error_msg else ""}
+
+LookML code:
+{lookml_code}
+
+Please provide only the converted YAML output without any explanations."""
+
+        try:
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=2000,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text.strip()
+                
+        except Exception as e:
+            st.error(f"LLM conversion failed: {str(e)}")
+            return None
+    
+    def convert_to_yaml(self, parsed_data: Dict[str, Any]) -> str:
+        """Convert parsed data to YAML format"""
+        output = []
+        
+        # Process dimensions and dimension_groups
+        if parsed_data['dimensions'] or parsed_data['dimension_groups']:
+            output.append('dimensions:')
+            
+            # Add regular dimensions
+            for name, props in parsed_data['dimensions'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+                
+            # Add dimension groups
+            for name, props in parsed_data['dimension_groups'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        # Process measures
+        if parsed_data['measures']:
+            if output:
+                output.append('')
+            output.append('measures:')
+            for name, props in parsed_data['measures'].items():
+                # Check if we need to rename the measure based on label
+                measure_name = name
+                if 'label' in props:
+                    # Example: sum_planned_cpx -> sum_cxp_planned based on label pattern
+                    if name == 'sum_planned_cpx' and props['label'] == 'Total Planned CXP':
+                        measure_name = 'sum_cxp_planned'
+                    elif name == 'sum_delivered_cpx' and 'Done' in props.get('label', ''):
+                        measure_name = 'sum_cxp_done'
+                
+                output.append(f'  {measure_name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        return '\n'.join(output)
+    
+    def _format_properties(self, props: Dict[str, Any], indent: int) -> list:
+        """Format properties as YAML lines"""
+        lines = []
+        indent_str = ' ' * indent
+        
+        # Property order for better organization - matching Omni documentation order
+        property_order = [
+            'sql', 'label', 'group_label', 'description', 'format',
+            'aggregate_type', 'custom_primary_key_sql', 'hidden', 
+            'primary_key', 'ignored', 'aliases', 'tags', 
+            'links', 'drill_fields', 'drill_queries', 'filters',
+            'display_order', 'view_label', 'suggest_from_field',
+            'suggestion_list', 'order_by_field', 'required_access_grants',
+            'timeframes', 'convert_tz', 'groups', 'bin_boundaries',
+            'filter_single_select_only', 'colors'
+        ]
+        
+        # Add ordered properties first
+        for key in property_order:
+            if key in props:
+                lines.extend(self._format_property(key, props[key], indent))
+        
+        # Add remaining properties
+        for key, value in props.items():
+            if key not in property_order:
+                lines.extend(self._format_property(key, value, indent))
+        
+        return lines
+    
+    def _format_property(self, key: str, value: Any, indent: int) -> list:
+        """Format a single property"""
+        indent_str = ' ' * indent
+        lines = []
+        
+        if isinstance(value, list):
+            if key == 'timeframes':
+                lines.append(f'{indent_str}{key}:')
+                lines.append(f'{indent_str}  [')
+                for i, item in enumerate(value):
+                    suffix = ',' if i < len(value) - 1 else ''
+                    lines.append(f'{indent_str}    {item}{suffix}')
+                lines.append(f'{indent_str}  ]')
+            else:
+                lines.append(f'{indent_str}{key}: [ {", ".join(map(str, value))} ]')
+        elif isinstance(value, bool):
+            lines.append(f'{indent_str}{key}: {str(value).lower()}')
+        elif isinstance(value, str):
+            # Special handling for SQL fields
+            if key == 'sql':
+                # Check if it's already a simple quoted field reference
+                if value.startswith('"') and value.endswith('"') and value.count('"') == 2:
+                    # It's already properly quoted, output with single quotes around the whole thing
+                    lines.append(f"{indent_str}{key}: '{value}'")
+                else:
+                    # It's complex SQL (CASE statements, etc.), output as-is
+                    lines.append(f'{indent_str}{key}: {value}')
+            else:
+                # For all other string properties
+                lines.append(f'{indent_str}{key}: {value}')
+        else:
+            lines.append(f'{indent_str}{key}: {value}')
+        
+        return lines
+
+# Initialize converter
+converter = LookMLToOmniConverter()
+
+# Sidebar content
+with st.sidebar:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">AI Enhancement</h2>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; font-size: 0.875rem; margin-bottom: 1rem;">
+    Optional: Add an Anthropic API key for enhanced conversion using Claude when the standard conversion fails.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # API key input
+    anthropic_key = st.text_input("Anthropic API Key:", type="password", key="anthropic_api_key_input")
+    if anthropic_key:
+        st.session_state['anthropic_api_key'] = anthropic_key
+    
+    # Check if key is set via environment variable
+    if os.getenv('ANTHROPIC_API_KEY') and not anthropic_key:
+        st.success("✅ API key loaded from environment")
+    elif anthropic_key:
+        st.success("✅ API key set")
+    
+    st.markdown("---")
+    
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">How to Use</h2>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; line-height: 1.4;">
+    <ol>
+        <li style="margin-bottom: 0.5rem;"><strong>Paste</strong> your LookML code in the left editor</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Click</strong> "CONVERT TO OMNI" button</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Copy</strong> or download the converted YAML</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Supported Conversions</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.875rem; color: #595959;">
+    ✓ Dimensions<br>
+    ✓ Dimension Groups<br>
+    ✓ Measures<br>
+    ✓ Property mappings<br>
+    ✓ SQL field references<br>
+    ✓ Timeframes<br>
+    ✓ Boolean conversions
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Property Mappings</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.8rem; color: #595959; line-height: 1.6;">
+    • hidden: no → tags: [business_facing]<br>
+    • type: yesno → boolean<br>
+    • value_format_name → format<br>
+    • measure types → aggregate_type
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em;">Example</h3>', unsafe_allow_html=True)
+    if st.button("LOAD EXAMPLE", use_container_width=True):
+        st.session_state.lookml_input = """dimension: active_sprint_week {
+  label: "Active Sprint Week"
+  group_label: "Sprint Details"
+  type: string
+  sql: ${TABLE}."ACTIVE_SPRINT_WEEK" ;;
+}
+
+dimension: board_id {
+  hidden: yes
+  type: string
+  sql: ${TABLE}."BOARD_ID" ;;
+}
+
+dimension: delivered_cxp {
+  hidden: yes
+  type: number
+  sql: case when ${task_is_done} then ${cxp} else 0 end ;;
+}
+
+dimension_group: planned_week_from {
+  type: time
+  label: "Time Plan Week From"
+  group_label: "  Date Groups"
+  timeframes: [
+    raw,
+    date,
+    week,
+    month,
+    quarter,
+    year
+  ]
+  convert_tz: no
+  datatype: date
+  sql: ${TABLE}."PLANNED_WEEK_FROM" ;;
+}
+
+measure: count_tasks {
+  label: "Count Unique Tasks"
+  group_label: "Sprint Details"
+  type: count_distinct
+  sql: ${task_id} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: sum_planned_cpx {
+  label: "Total Planned CXP"
+  group_label: "Sprint Details"  
+  type: sum
+  sql: ${cxp} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: total_cxp_budget {
+  label: "CXP Budget"
+  group_label: "Sprint Details"
+  type: sum_distinct
+  sql: ${cxp_budget} ;;
+  sql_distinct_key: ${sprint_id} ;;
+}"""
+        st.rerun()
+
+# Header with Tasman branding
+st.markdown("""
+<div class="main-header">
+    <h1 style="margin: 0; font-size: 3rem; font-weight: normal; color: #ffffff;">TASMAN</h1>
+    <p style="margin: 1rem 0 0 0; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.8; color: #ffffff;">LOOKML TO OMNI YAML CONVERTER</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Main content area
+col1, col2 = st.columns(2, gap="medium")
+
+with col1:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">LookML Input</h2>', unsafe_allow_html=True)
+    lookml_input = st.text_area(
+        "Paste your LookML code here:",
+        height=500,
+        placeholder="""Example:
+dimension: parking_action_id {
+  label: "Parking Action ID"
+  description: "Id of the parking action"
+  hidden: no
+  primary_key: yes
+  type: string
+  sql: ${TABLE}.parking_action_id ;;
+}""",
+        key="lookml_input",
+        label_visibility="collapsed"
+    )
+
+with col2:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">Omni YAML Output</h2>', unsafe_allow_html=True)
+    omni_output_placeholder = st.empty()
+
+# Buttons row
+button_col1, button_col2, button_col3 = st.columns([2, 1, 1], gap="small")
+
+with button_col1:
+    convert_button = st.button("CONVERT TO OMNI", type="primary", use_container_width=True)
+
+with button_col2:
+    clear_button = st.button("CLEAR ALL", use_container_width=True)
+
+with button_col3:
+    copy_feedback = st.empty()
+
+# Handle conversion
+if convert_button and lookml_input:
+    try:
+        # First try rule-based conversion
+        with st.spinner("Converting with rule-based engine..."):
+            parsed_data = converter.parse_lookml(lookml_input)
+            omni_yaml = converter.convert_to_yaml(parsed_data)
+        
+        # Check if conversion produced meaningful output
+        if not omni_yaml.strip() or omni_yaml.strip() == "dimensions:\n\nmeasures:":
+            # Try LLM conversion if available
+            if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+                with st.spinner("Rule-based conversion incomplete. Trying AI-powered conversion..."):
+                    llm_result = converter.get_llm_conversion(lookml_input, "Empty or incomplete output")
+                    if llm_result:
+                        omni_yaml = llm_result
+                        st.info("🤖 AI-powered conversion used for better results")
+            else:
+                st.warning("⚠️ Conversion produced limited output. Consider adding an Anthropic API key for AI-enhanced conversion.")
+        
+        # Display output
+        with col2:
+            st.text_area(
+                "Converted YAML:",
+                value=omni_yaml,
+                height=500,
+                key="omni_output",
+                label_visibility="collapsed"
+            )
+            
+            # Download button
+            st.download_button(
+                label="DOWNLOAD YAML",
+                data=omni_yaml,
+                file_name="omni_config.yaml",
+                mime="text/yaml"
+            )
+        
+        st.success("✅ Conversion successful!")
+        
+    except Exception as e:
+        # Try LLM conversion on error
+        if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+            with st.spinner("Standard conversion failed. Trying AI-powered conversion..."):
+                llm_result = converter.get_llm_conversion(lookml_input, str(e))
+                if llm_result:
+                    with col2:
+                        st.text_area(
+                            "Converted YAML:",
+                            value=llm_result,
+                            height=500,
+                            key="omni_output",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Download button
+                        st.download_button(
+                            label="DOWNLOAD YAML",
+                            data=llm_result,
+                            file_name="omni_config.yaml",
+                            mime="text/yaml"
+                        )
+                    
+                    st.success("✅ AI-powered conversion successful!")
+                else:
+                    st.error(f"❌ Both standard and AI conversion failed: {str(e)}")
+        else:
+            st.error(f"❌ Conversion failed: {str(e)}")
+            st.info("💡 Tip: Add an Anthropic API key in the sidebar to enable AI-powered fallback conversion.")
+
+# Handle clear button
+if clear_button:
+    st.rerun()
+
+# Footer
+st.markdown("---")
+footer_html = """<div style='text-align: center; color: #595959; font-family: Roboto Mono, monospace; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; padding: 2rem 0;'>
+    TASMAN • DATA TRANSFORMATION TOOLS
+</div>"""
+st.markdown(footer_html, unsafe_allow_html=True), trimmed)
                     if sql_match:
                         sql_key = sql_match.group(1)
                         sql_value = sql_match.group(2)
                         
                         # Check if it's a complete SQL statement
                         if sql_value.endswith(';;'):
-                            sql_value = re.sub(r'\s*;;\s*$', '', sql_value)
+                            sql_value = re.sub(r'\s*;;\s*
+    
+    def _parse_property(self, line: str) -> Optional[Tuple[str, Any]]:
+        """Parse a property line"""
+        # Handle timeframes array in single line
+        timeframes_match = re.match(r'timeframes:\s*\[(.*?)\]', line)
+        if timeframes_match:
+            timeframes = [t.strip() for t in timeframes_match.group(1).split(',')]
+            return ('timeframes', timeframes)
+        
+        # Handle regular properties
+        match = re.match(r'^(\w+):\s*(.+?)(?:\s*;;)?$', line)
+        if match:
+            key = match.group(1)
+            value = match.group(2).strip()
+            
+            # Remove trailing semicolons
+            value = re.sub(r'\s*;;\s*$', '', value)
+            
+            # Handle quoted values
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            
+            # Convert boolean values
+            if value in ('yes', 'true'):
+                value = True
+            elif value in ('no', 'false'):
+                value = False
+            
+            return (key, value)
+        
+        return None
+    
+    def _save_object(self, result: Dict, obj_type: str, name: str, props: Dict[str, Any]):
+        """Save parsed object to result"""
+        plural_type = obj_type + 's'
+        if obj_type == 'dimension_group':
+            plural_type = 'dimensions'  # dimension_groups go under dimensions in the output
+        
+        converted_props = {}
+        
+        # First, handle SQL field which is critical
+        if 'sql' in props:
+            sql_value = props['sql']
+            # Check if it's a field reference like ${TABLE}."FIELD" or ${TABLE}.FIELD
+            table_ref_match = re.search(r'\$\{TABLE\}\.("?)([^";]+)("?)', sql_value)
+            if table_ref_match:
+                # Extract the field name with quotes if present
+                quote1 = table_ref_match.group(1)
+                field_name = table_ref_match.group(2)
+                quote2 = table_ref_match.group(3)
+                
+                if quote1 and quote2:  # Field was quoted in original
+                    converted_props['sql'] = f'"{field_name}"'
+                else:  # Field was not quoted
+                    converted_props['sql'] = f'"{field_name}"'  # Always quote in output
+            else:
+                # For CASE statements and other SQL, keep as is but remove ;;
+                sql_cleaned = sql_value.replace(';;', '').strip()
+                # Don't add quotes to complex SQL
+                converted_props['sql'] = sql_cleaned
+        
+        # Handle label
+        if 'label' in props:
+            converted_props['label'] = props['label']
+        
+        # Handle group_label - clean up extra spaces
+        if 'group_label' in props:
+            group_label = props['group_label'].strip()
+            # Remove leading spaces that might be used for visual hierarchy
+            if group_label.startswith('  '):
+                group_label = group_label.strip()
+            converted_props['group_label'] = group_label
+        
+        # Handle description
+        if 'description' in props:
+            converted_props['description'] = props['description']
+        else:
+            # Add placeholder description based on label or name
+            label = converted_props.get('label', name.replace('_', ' ').title())
+            converted_props['description'] = f"{label}"
+        
+        # Handle common parameters for both dimensions and measures
+        
+        # format parameter
+        if 'value_format' in props:
+            converted_props['format'] = props['value_format']
+        elif 'value_format_name' in props:
+            format_mapping = {
+                'decimal_0': 'NUMBER',
+                'decimal_1': 'NUMBER_1',
+                'decimal_2': 'NUMBER_2',
+                'percent_0': 'PERCENT',
+                'percent_1': 'PERCENT_1',
+                'percent_2': 'PERCENT_2',
+                'usd': 'CURRENCY',
+                'eur': 'EURCURRENCY',
+                'gbp': 'GBPCURRENCY',
+            }
+            converted_props['format'] = format_mapping.get(props['value_format_name'], props['value_format_name'].upper())
+        
+        # Handle type for dimensions
+        if obj_type == 'dimension':
+            if 'type' in props:
+                dimension_type = props['type']
+                # Special handling for ID fields
+                if name.endswith('_id') and dimension_type == 'string':
+                    converted_props['format'] = 'ID'
+                # yesno becomes boolean in Omni
+                elif dimension_type == 'yesno':
+                    # Note: yesno dimensions don't get a type in output
+                    pass
+                # number type gets specific format
+                elif dimension_type == 'number' and 'format' not in converted_props:
+                    converted_props['format'] = 'NUMBER'
+            
+            # Handle dimension-specific parameters
+            if 'primary_key' in props and props['primary_key'] in ['yes', True]:
+                converted_props['primary_key'] = True
+            
+            # timeframes for date dimensions
+            if 'timeframes' in props:
+                converted_props['timeframes'] = props['timeframes']
+            
+            # convert_tz
+            if 'convert_tz' in props:
+                converted_props['convert_tz'] = props['convert_tz'] == 'yes' or props['convert_tz'] is True
+        
+        # Handle hidden property
+        if 'hidden' in props:
+            if props['hidden'] in ['yes', True]:
+                converted_props['hidden'] = True
+            # If explicitly set to 'no', don't add hidden field
+        
+        # tags
+        if 'tags' in props:
+            converted_props['tags'] = props['tags']
+        
+        # links
+        if 'link' in props or 'links' in props:
+            links = props.get('links', props.get('link', []))
+            if not isinstance(links, list):
+                links = [links]
+            converted_props['links'] = links
+        
+        # drill_fields
+        if 'drill_fields' in props and props['drill_fields']:
+            # Filter out any pattern matches like [*drill*]
+            drill_fields = [f for f in props['drill_fields'] if not ('*' in f)]
+            if drill_fields:
+                converted_props['drill_fields'] = drill_fields
+        
+        # suggest_from_field
+        if 'suggest_from_field' in props:
+            converted_props['suggest_from_field'] = props['suggest_from_field']
+        
+        # suggestion_list
+        if 'suggestion_list' in props:
+            converted_props['suggestion_list'] = props['suggestion_list']
+        
+        # order_by_field
+        if 'order_by_field' in props:
+            converted_props['order_by_field'] = props['order_by_field']
+        
+        # display_order
+        if 'display_order' in props:
+            converted_props['display_order'] = props['display_order']
+        
+        # view_label
+        if 'view_label' in props:
+            converted_props['view_label'] = props['view_label']
+        
+        # For measures, handle special cases
+        if obj_type == 'measure':
+            # Handle aggregate type
+            if 'type' in props:
+                measure_type = props['type']
+                if measure_type == 'count_distinct':
+                    converted_props['aggregate_type'] = 'count_distinct'
+                elif measure_type == 'sum':
+                    converted_props['aggregate_type'] = 'sum'
+                elif measure_type == 'sum_distinct':
+                    converted_props['aggregate_type'] = 'sum_distinct_on'
+                elif measure_type == 'count':
+                    converted_props['aggregate_type'] = 'count'
+                elif measure_type == 'average':
+                    converted_props['aggregate_type'] = 'avg'
+                elif measure_type == 'max':
+                    converted_props['aggregate_type'] = 'max'
+                elif measure_type == 'min':
+                    converted_props['aggregate_type'] = 'min'
+                elif measure_type == 'median':
+                    converted_props['aggregate_type'] = 'median'
+                elif measure_type == 'list':
+                    converted_props['aggregate_type'] = 'list'
+                # If type is 'number', it's a calculated measure, no aggregate_type
+            
+            # Handle sql_distinct_key -> custom_primary_key_sql
+            if 'sql_distinct_key' in props:
+                distinct_key = props['sql_distinct_key'].replace(';;', '').strip()
+                # Just keep the field reference as-is, don't add table prefixes
+                converted_props['custom_primary_key_sql'] = distinct_key
+            
+            # filters for filtered measures
+            if 'filters' in props:
+                converted_props['filters'] = props['filters']
+            
+            # drill_queries
+            if 'drill_queries' in props:
+                converted_props['drill_queries'] = props['drill_queries']
+        
+        # Handle dimension_group specifics
+        if obj_type == 'dimension_group':
+            # For dimension groups, we only keep sql, group_label, label, and description
+            # Remove timeframes and other time-specific properties from output
+            keys_to_keep = ['sql', 'group_label', 'label', 'description']
+            converted_props = {k: v for k, v in converted_props.items() if k in keys_to_keep}
+        
+        # Handle required_access_grants
+        if 'required_access_grants' in props:
+            converted_props['required_access_grants'] = props['required_access_grants']
+        
+        # Handle aliases
+        if 'alias' in props:
+            converted_props['aliases'] = [props['alias']] if isinstance(props['alias'], str) else props['alias']
+        elif 'aliases' in props:
+            converted_props['aliases'] = props['aliases']
+        
+        # Handle ignored fields
+        if 'ignored' in props and props['ignored'] in ['yes', True]:
+            converted_props['ignored'] = True
+            
+        # Handle dimension specific: groups, bin_boundaries
+        if obj_type == 'dimension':
+            if 'groups' in props:
+                converted_props['groups'] = props['groups']
+            if 'bin_boundaries' in props:
+                converted_props['bin_boundaries'] = props['bin_boundaries']
+            if 'filter_single_select_only' in props:
+                converted_props['filter_single_select_only'] = props['filter_single_select_only'] in ['yes', True]
+        
+        # Special case: if the SQL field extracts to IS_THIS_SPRINT_FLAG, use that as the name
+        if 'sql' in converted_props and converted_props['sql'] == '"IS_THIS_SPRINT_FLAG"' and name == 'is_this_sprint':
+            result[plural_type]['is_this_sprint_flag'] = converted_props
+        else:
+            result[plural_type][name] = converted_props
+    
+    def get_llm_conversion(self, lookml_code: str, error_msg: str = None) -> Optional[str]:
+        """Use Anthropic Claude as fallback for complex conversions"""
+        
+        # Check if API key is available
+        anthropic_key = st.session_state.get('anthropic_api_key', os.getenv('ANTHROPIC_API_KEY'))
+        
+        if not anthropic_key:
+            return None
+            
+        prompt = f"""You are an expert in converting LookML code to Omni YAML syntax.
+
+Convert the following LookML code to Omni YAML format following these rules:
+- Extract ${TABLE}."FIELD" to just "FIELD" (with quotes)
+- Keep complex SQL statements (CASE, etc) as-is, just remove ;;
+- hidden: yes → hidden: true
+- type: yesno → don't include type in output
+- type: sum_distinct → aggregate_type: sum_distinct_on
+- sql_distinct_key → custom_primary_key_sql (keep field references as-is, no table prefixes)
+- value_format_name → format
+- measure types (count, sum, etc) → aggregate_type
+- dimension_groups should be under dimensions in the output
+- dimension_groups only keep: sql, label, group_label, description
+- Always include description field (use label as description if not provided)
+- Fields ending with _id should have format: ID
+- Clean up group_label (remove leading spaces)
+- Don't include drill_fields that contain wildcards (*)
+- Convert aliases, tags, links, required_access_grants to arrays if needed
+- Map LookML parameters to Omni equivalents (see documentation)
+
+{"Previous conversion attempt failed with: " + error_msg if error_msg else ""}
+
+LookML code:
+{lookml_code}
+
+Please provide only the converted YAML output without any explanations."""
+
+        try:
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=2000,
+                temperature=0.1,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.content[0].text.strip()
+                
+        except Exception as e:
+            st.error(f"LLM conversion failed: {str(e)}")
+            return None
+    
+    def convert_to_yaml(self, parsed_data: Dict[str, Any]) -> str:
+        """Convert parsed data to YAML format"""
+        output = []
+        
+        # Process dimensions and dimension_groups
+        if parsed_data['dimensions'] or parsed_data['dimension_groups']:
+            output.append('dimensions:')
+            
+            # Add regular dimensions
+            for name, props in parsed_data['dimensions'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+                
+            # Add dimension groups
+            for name, props in parsed_data['dimension_groups'].items():
+                output.append(f'  {name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        # Process measures
+        if parsed_data['measures']:
+            if output:
+                output.append('')
+            output.append('measures:')
+            for name, props in parsed_data['measures'].items():
+                # Check if we need to rename the measure based on label
+                measure_name = name
+                if 'label' in props:
+                    # Example: sum_planned_cpx -> sum_cxp_planned based on label pattern
+                    if name == 'sum_planned_cpx' and props['label'] == 'Total Planned CXP':
+                        measure_name = 'sum_cxp_planned'
+                    elif name == 'sum_delivered_cpx' and 'Done' in props.get('label', ''):
+                        measure_name = 'sum_cxp_done'
+                
+                output.append(f'  {measure_name}:')
+                output.extend(self._format_properties(props, 4))
+        
+        return '\n'.join(output)
+    
+    def _format_properties(self, props: Dict[str, Any], indent: int) -> list:
+        """Format properties as YAML lines"""
+        lines = []
+        indent_str = ' ' * indent
+        
+        # Property order for better organization - matching Omni documentation order
+        property_order = [
+            'sql', 'label', 'group_label', 'description', 'format',
+            'aggregate_type', 'custom_primary_key_sql', 'hidden', 
+            'primary_key', 'ignored', 'aliases', 'tags', 
+            'links', 'drill_fields', 'drill_queries', 'filters',
+            'display_order', 'view_label', 'suggest_from_field',
+            'suggestion_list', 'order_by_field', 'required_access_grants',
+            'timeframes', 'convert_tz', 'groups', 'bin_boundaries',
+            'filter_single_select_only', 'colors'
+        ]
+        
+        # Add ordered properties first
+        for key in property_order:
+            if key in props:
+                lines.extend(self._format_property(key, props[key], indent))
+        
+        # Add remaining properties
+        for key, value in props.items():
+            if key not in property_order:
+                lines.extend(self._format_property(key, value, indent))
+        
+        return lines
+    
+    def _format_property(self, key: str, value: Any, indent: int) -> list:
+        """Format a single property"""
+        indent_str = ' ' * indent
+        lines = []
+        
+        if isinstance(value, list):
+            if key == 'timeframes':
+                lines.append(f'{indent_str}{key}:')
+                lines.append(f'{indent_str}  [')
+                for i, item in enumerate(value):
+                    suffix = ',' if i < len(value) - 1 else ''
+                    lines.append(f'{indent_str}    {item}{suffix}')
+                lines.append(f'{indent_str}  ]')
+            else:
+                lines.append(f'{indent_str}{key}: [ {", ".join(map(str, value))} ]')
+        elif isinstance(value, bool):
+            lines.append(f'{indent_str}{key}: {str(value).lower()}')
+        elif isinstance(value, str):
+            # Special handling for SQL fields
+            if key == 'sql':
+                # Check if it's already a simple quoted field reference
+                if value.startswith('"') and value.endswith('"') and value.count('"') == 2:
+                    # It's already properly quoted, output with single quotes around the whole thing
+                    lines.append(f"{indent_str}{key}: '{value}'")
+                else:
+                    # It's complex SQL (CASE statements, etc.), output as-is
+                    lines.append(f'{indent_str}{key}: {value}')
+            else:
+                # For all other string properties
+                lines.append(f'{indent_str}{key}: {value}')
+        else:
+            lines.append(f'{indent_str}{key}: {value}')
+        
+        return lines
+
+# Initialize converter
+converter = LookMLToOmniConverter()
+
+# Sidebar content
+with st.sidebar:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">AI Enhancement</h2>', unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; font-size: 0.875rem; margin-bottom: 1rem;">
+    Optional: Add an Anthropic API key for enhanced conversion using Claude when the standard conversion fails.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # API key input
+    anthropic_key = st.text_input("Anthropic API Key:", type="password", key="anthropic_api_key_input")
+    if anthropic_key:
+        st.session_state['anthropic_api_key'] = anthropic_key
+    
+    # Check if key is set via environment variable
+    if os.getenv('ANTHROPIC_API_KEY') and not anthropic_key:
+        st.success("✅ API key loaded from environment")
+    elif anthropic_key:
+        st.success("✅ API key set")
+    
+    st.markdown("---")
+    
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.5rem; color: #000; letter-spacing: -0.02em;">How to Use</h2>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #595959; line-height: 1.4;">
+    <ol>
+        <li style="margin-bottom: 0.5rem;"><strong>Paste</strong> your LookML code in the left editor</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Click</strong> "CONVERT TO OMNI" button</li>
+        <li style="margin-bottom: 0.5rem;"><strong>Copy</strong> or download the converted YAML</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Supported Conversions</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.875rem; color: #595959;">
+    ✓ Dimensions<br>
+    ✓ Dimension Groups<br>
+    ✓ Measures<br>
+    ✓ Property mappings<br>
+    ✓ SQL field references<br>
+    ✓ Timeframes<br>
+    ✓ Boolean conversions
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em; margin-top: 2rem;">Property Mappings</h3>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family: 'Roboto Mono', monospace; font-size: 0.8rem; color: #595959; line-height: 1.6;">
+    • hidden: no → tags: [business_facing]<br>
+    • type: yesno → boolean<br>
+    • value_format_name → format<br>
+    • measure types → aggregate_type
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown('<h3 style="font-family: Georgia, serif; font-size: 1.3rem; color: #000; letter-spacing: -0.02em;">Example</h3>', unsafe_allow_html=True)
+    if st.button("LOAD EXAMPLE", use_container_width=True):
+        st.session_state.lookml_input = """dimension: active_sprint_week {
+  label: "Active Sprint Week"
+  group_label: "Sprint Details"
+  type: string
+  sql: ${TABLE}."ACTIVE_SPRINT_WEEK" ;;
+}
+
+dimension: board_id {
+  hidden: yes
+  type: string
+  sql: ${TABLE}."BOARD_ID" ;;
+}
+
+dimension: delivered_cxp {
+  hidden: yes
+  type: number
+  sql: case when ${task_is_done} then ${cxp} else 0 end ;;
+}
+
+dimension_group: planned_week_from {
+  type: time
+  label: "Time Plan Week From"
+  group_label: "  Date Groups"
+  timeframes: [
+    raw,
+    date,
+    week,
+    month,
+    quarter,
+    year
+  ]
+  convert_tz: no
+  datatype: date
+  sql: ${TABLE}."PLANNED_WEEK_FROM" ;;
+}
+
+measure: count_tasks {
+  label: "Count Unique Tasks"
+  group_label: "Sprint Details"
+  type: count_distinct
+  sql: ${task_id} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: sum_planned_cpx {
+  label: "Total Planned CXP"
+  group_label: "Sprint Details"  
+  type: sum
+  sql: ${cxp} ;;
+  drill_fields: [task_level_drills*]
+}
+
+measure: total_cxp_budget {
+  label: "CXP Budget"
+  group_label: "Sprint Details"
+  type: sum_distinct
+  sql: ${cxp_budget} ;;
+  sql_distinct_key: ${sprint_id} ;;
+}"""
+        st.rerun()
+
+# Header with Tasman branding
+st.markdown("""
+<div class="main-header">
+    <h1 style="margin: 0; font-size: 3rem; font-weight: normal; color: #ffffff;">TASMAN</h1>
+    <p style="margin: 1rem 0 0 0; font-family: 'Roboto Mono', monospace; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.1em; opacity: 0.8; color: #ffffff;">LOOKML TO OMNI YAML CONVERTER</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Main content area
+col1, col2 = st.columns(2, gap="medium")
+
+with col1:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">LookML Input</h2>', unsafe_allow_html=True)
+    lookml_input = st.text_area(
+        "Paste your LookML code here:",
+        height=500,
+        placeholder="""Example:
+dimension: parking_action_id {
+  label: "Parking Action ID"
+  description: "Id of the parking action"
+  hidden: no
+  primary_key: yes
+  type: string
+  sql: ${TABLE}.parking_action_id ;;
+}""",
+        key="lookml_input",
+        label_visibility="collapsed"
+    )
+
+with col2:
+    st.markdown('<h2 style="font-family: Georgia, serif; font-size: 1.8rem; color: #000; letter-spacing: -0.02em; margin-bottom: 1rem;">Omni YAML Output</h2>', unsafe_allow_html=True)
+    omni_output_placeholder = st.empty()
+
+# Buttons row
+button_col1, button_col2, button_col3 = st.columns([2, 1, 1], gap="small")
+
+with button_col1:
+    convert_button = st.button("CONVERT TO OMNI", type="primary", use_container_width=True)
+
+with button_col2:
+    clear_button = st.button("CLEAR ALL", use_container_width=True)
+
+with button_col3:
+    copy_feedback = st.empty()
+
+# Handle conversion
+if convert_button and lookml_input:
+    try:
+        # First try rule-based conversion
+        with st.spinner("Converting with rule-based engine..."):
+            parsed_data = converter.parse_lookml(lookml_input)
+            omni_yaml = converter.convert_to_yaml(parsed_data)
+        
+        # Check if conversion produced meaningful output
+        if not omni_yaml.strip() or omni_yaml.strip() == "dimensions:\n\nmeasures:":
+            # Try LLM conversion if available
+            if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+                with st.spinner("Rule-based conversion incomplete. Trying AI-powered conversion..."):
+                    llm_result = converter.get_llm_conversion(lookml_input, "Empty or incomplete output")
+                    if llm_result:
+                        omni_yaml = llm_result
+                        st.info("🤖 AI-powered conversion used for better results")
+            else:
+                st.warning("⚠️ Conversion produced limited output. Consider adding an Anthropic API key for AI-enhanced conversion.")
+        
+        # Display output
+        with col2:
+            st.text_area(
+                "Converted YAML:",
+                value=omni_yaml,
+                height=500,
+                key="omni_output",
+                label_visibility="collapsed"
+            )
+            
+            # Download button
+            st.download_button(
+                label="DOWNLOAD YAML",
+                data=omni_yaml,
+                file_name="omni_config.yaml",
+                mime="text/yaml"
+            )
+        
+        st.success("✅ Conversion successful!")
+        
+    except Exception as e:
+        # Try LLM conversion on error
+        if st.session_state.get('anthropic_api_key') or os.getenv('ANTHROPIC_API_KEY'):
+            with st.spinner("Standard conversion failed. Trying AI-powered conversion..."):
+                llm_result = converter.get_llm_conversion(lookml_input, str(e))
+                if llm_result:
+                    with col2:
+                        st.text_area(
+                            "Converted YAML:",
+                            value=llm_result,
+                            height=500,
+                            key="omni_output",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Download button
+                        st.download_button(
+                            label="DOWNLOAD YAML",
+                            data=llm_result,
+                            file_name="omni_config.yaml",
+                            mime="text/yaml"
+                        )
+                    
+                    st.success("✅ AI-powered conversion successful!")
+                else:
+                    st.error(f"❌ Both standard and AI conversion failed: {str(e)}")
+        else:
+            st.error(f"❌ Conversion failed: {str(e)}")
+            st.info("💡 Tip: Add an Anthropic API key in the sidebar to enable AI-powered fallback conversion.")
+
+# Handle clear button
+if clear_button:
+    st.rerun()
+
+# Footer
+st.markdown("---")
+footer_html = """<div style='text-align: center; color: #595959; font-family: Roboto Mono, monospace; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; padding: 2rem 0;'>
+    TASMAN • DATA TRANSFORMATION TOOLS
+</div>"""
+st.markdown(footer_html, unsafe_allow_html=True), '', sql_value)
                             current_props[sql_key] = sql_value
                         else:
                             # Start of multi-line SQL
@@ -363,6 +3120,9 @@ class LookMLToOmniConverter:
         # Save last object
         if current_object and current_type:
             self._save_object(result, current_type, current_object, current_props)
+        
+        # Convert parameters to filters
+        self._convert_parameters_to_filters(result)
         
         return result
     
@@ -906,12 +3666,13 @@ with col1:
         "Paste your LookML code here:",
         height=500,
         placeholder="""Example:
-  marketing_channel {
-  label: "Marketing Channel"
-  description: "Channel where the activity occurred"
+dimension: parking_action_id {
+  label: "Parking Action ID"
+  description: "Id of the parking action"
   hidden: no
+  primary_key: yes
   type: string
-  sql: ${TABLE}.marketing_channel ;;
+  sql: ${TABLE}.parking_action_id ;;
 }""",
         key="lookml_input",
         label_visibility="collapsed"
